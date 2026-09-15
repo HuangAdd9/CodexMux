@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+# ------------------------------------------------------------
+# 基础目录
+# ------------------------------------------------------------
+
+# ~/.codex 只作为共享数据源；显式 resume/fork 时可导入历史 session
+SHARED_HOME="${CODEX_SHARED_HOME:-$HOME/.codex}"
+
+# 每个 ChatGPT 账号都有独立 CODEX_HOME
+ACCOUNTS_HOME="${CODEX_ACCOUNTS_HOME:-$HOME/.codex-accounts}"
+
+# wrapper 自己的锁
+LOCK_HOME="${CODEX_ACCOUNT_LOCK_HOME:-$HOME/.cache/codex-account/locks}"
+SYNC_BIN="${CODEX_SESSION_SYNC_BIN:-$HOME/bin/codex-session-sync}"
+
+
+die() {
+    echo "codex-account: $*" >&2
+    exit 1
+}
+
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  codex-account --add <account>
+  codex-account --list
+  codex-account <account> [codex arguments...]
+
+Examples:
+  codex-account --add newaccount
+  codex-account newaccount login --device-auth
+  codex-account personal
+  codex-account a
+  codex-account personal resume 11111111-1111-4111-8111-111111111111
+  codex-account a exec "检查这个项目"
+  codex-account b exec resume <SESSION_ID> "继续完成任务"
+
+Accounts:
+  --add 仅创建独立账号目录，不登录、不复制认证；已有目录保持不变。
+  --list 仅列出已有 auth.json 的账号。
+
+Concurrency:
+  不同账号 + 不同 session：可以并发
+  同一个账号 + 不同 session：可以并发
+  显式 resume 同一 session：跨账号互斥，先锁定再同步完整历史
+  真正分叉的历史不会自动合并；需要备份后明确选择保留的分支
+
+Interactive sessions:
+  每个账号使用独立 CODEX_HOME，支持在 TUI 中安全 resume/fork。
+USAGE
+}
+
+
+# ------------------------------------------------------------
+# --list / help
+# ------------------------------------------------------------
+
+case "${1:-}" in
+    --add)
+        [[ "$#" -eq 2 ]] || die "用法: codex-account --add <account>"
+        NEW_ACCOUNT="$2"
+        [[ "$NEW_ACCOUNT" =~ ^[A-Za-z0-9._-]+$ ]] &&
+            [[ "$NEW_ACCOUNT" != "." && "$NEW_ACCOUNT" != ".." ]] ||
+            die "非法账号名称: $NEW_ACCOUNT"
+        NEW_ACCOUNT_HOME="$ACCOUNTS_HOME/$NEW_ACCOUNT"
+        [[ ! -L "$NEW_ACCOUNT_HOME" ]] || die "账号路径是符号链接: $NEW_ACCOUNT_HOME"
+        mkdir -p -- "$ACCOUNTS_HOME" || die "无法创建账号根目录: $ACCOUNTS_HOME"
+        if mkdir -m 700 -- "$NEW_ACCOUNT_HOME" 2>/dev/null; then
+            echo "codex-account: 已创建账号 '$NEW_ACCOUNT'（未登录）: $NEW_ACCOUNT_HOME"
+        elif [[ -d "$NEW_ACCOUNT_HOME" && ! -L "$NEW_ACCOUNT_HOME" ]]; then
+            echo "codex-account: 账号 '$NEW_ACCOUNT' 已存在，保持不变: $NEW_ACCOUNT_HOME"
+        else
+            die "无法创建账号目录: $NEW_ACCOUNT_HOME"
+        fi
+        exit 0
+        ;;
+
+    --list)
+        if [[ ! -d "$ACCOUNTS_HOME" ]]; then
+            exit 0
+        fi
+
+        find "$ACCOUNTS_HOME" \
+            -mindepth 2 \
+            -maxdepth 2 \
+            -type f \
+            -name auth.json \
+            -printf '%h\n' |
+        while IFS= read -r dir; do
+            basename "$dir"
+        done |
+        sort
+
+        exit 0
+        ;;
+
+    -h|--help|"")
+        usage
+        exit 0
+        ;;
+esac
+
+
+# ------------------------------------------------------------
+# 读取账号
+# ------------------------------------------------------------
+
+ACCOUNT="$1"
+shift
+
+[[ "$ACCOUNT" =~ ^[A-Za-z0-9._-]+$ ]] &&
+    [[ "$ACCOUNT" != "." && "$ACCOUNT" != ".." ]] ||
+    die "非法账号名称: $ACCOUNT"
+
+ACCOUNT_HOME="$ACCOUNTS_HOME/$ACCOUNT"
+ACCOUNT_AUTH="$ACCOUNT_HOME/auth.json"
+
+SHARED_SESSIONS="$SHARED_HOME/sessions"
+ACCOUNT_SESSIONS="$ACCOUNT_HOME/sessions"
+
+[[ -d "$ACCOUNT_HOME" ]] ||
+    die "账号目录不存在: $ACCOUNT_HOME"
+
+[[ -f "$ACCOUNT_AUTH" || "${1:-}" == "login" ]] ||
+    die "账号认证不存在: $ACCOUNT_AUTH；请先运行 codex-account $ACCOUNT login"
+
+command -v codex >/dev/null 2>&1 ||
+    die "找不到 codex"
+
+command -v flock >/dev/null 2>&1 ||
+    die "找不到 flock，请安装 util-linux"
+
+command -v sha256sum >/dev/null 2>&1 ||
+    die "找不到 sha256sum"
+
+command -v python3 >/dev/null 2>&1 ||
+    die "找不到 python3，无法解析 session lineage"
+
+CODEX_BIN="$(command -v codex)"
+
+
+# ------------------------------------------------------------
+# 权限
+# ------------------------------------------------------------
+
+chmod 600 "$ACCOUNT_AUTH" 2>/dev/null || true
+
+mkdir -p "$SHARED_SESSIONS"
+mkdir -p "$LOCK_HOME"
+
+
+# ------------------------------------------------------------
+# 短暂锁定账号目录初始化
+#
+# 同一账号的不同 Codex session 可以并发。这里仅串行化 wrapper
+# 自己执行的目录初始化，初始化结束后立即释放。
+# ------------------------------------------------------------
+
+ACCOUNT_HASH="$(
+    printf '%s' "$ACCOUNT_HOME" |
+    sha256sum |
+    awk '{print $1}'
+)"
+
+ACCOUNT_SETUP_LOCK="$LOCK_HOME/account-setup-$ACCOUNT_HASH.lock"
+
+exec 9>"$ACCOUNT_SETUP_LOCK"
+flock 9 || die "无法锁定账号 '$ACCOUNT' 的初始化操作。"
+
+
+# ------------------------------------------------------------
+# 每个账号必须使用 CODEX_HOME 内的真实 sessions 目录。
+#
+# app-server 在 fork 时会规范化 rollout 路径并检查它是否仍位于
+# CODEX_HOME。指向 ~/.codex/sessions 的软链接会在规范化后越出账号
+# 目录，因此不能用于支持 fork。
+# ------------------------------------------------------------
+
+if [[ -L "$ACCOUNT_SESSIONS" ]]; then
+    CURRENT_SESSIONS_TARGET="$(readlink -f "$ACCOUNT_SESSIONS")"
+    SHARED_SESSIONS_TARGET="$(readlink -f "$SHARED_SESSIONS")"
+
+    if [[ "$CURRENT_SESSIONS_TARGET" != "$SHARED_SESSIONS_TARGET" ]]; then
+        die "$ACCOUNT_SESSIONS 已经指向其他位置: $CURRENT_SESSIONS_TARGET"
+    fi
+
+    unlink "$ACCOUNT_SESSIONS" ||
+        die "无法移除旧 sessions 软链接: $ACCOUNT_SESSIONS"
+    mkdir -m 700 "$ACCOUNT_SESSIONS" ||
+        die "无法创建账号 sessions 目录: $ACCOUNT_SESSIONS"
+    echo "[codex-account] migrated_sessions_dir=$ACCOUNT_SESSIONS" >&2
+elif [[ -e "$ACCOUNT_SESSIONS" ]] && [[ ! -d "$ACCOUNT_SESSIONS" ]]; then
+    die "$ACCOUNT_SESSIONS 已存在但不是目录。"
+else
+    mkdir -p "$ACCOUNT_SESSIONS" ||
+        die "无法创建账号 sessions 目录: $ACCOUNT_SESSIONS"
+fi
+
+# 后续 Codex 运行无需持有账号级锁；同一显式 session 仍在下方单独加锁。
+flock -u 9
+exec 9>&-
+
+
+# ------------------------------------------------------------
+# 可选共享全局 AGENTS.md / skills / rules
+#
+# 如果账号目录自己已经有这些内容，则保留账号自己的。
+# ------------------------------------------------------------
+
+if [[ -f "$SHARED_HOME/AGENTS.md" ]] &&
+   [[ ! -e "$ACCOUNT_HOME/AGENTS.md" ]] &&
+   [[ ! -L "$ACCOUNT_HOME/AGENTS.md" ]]; then
+
+    ln -s "$SHARED_HOME/AGENTS.md" "$ACCOUNT_HOME/AGENTS.md"
+fi
+
+
+if [[ -d "$SHARED_HOME/skills" ]] &&
+   [[ ! -e "$ACCOUNT_HOME/skills" ]] &&
+   [[ ! -L "$ACCOUNT_HOME/skills" ]]; then
+
+    ln -s "$SHARED_HOME/skills" "$ACCOUNT_HOME/skills"
+fi
+
+
+if [[ -d "$SHARED_HOME/rules" ]] &&
+   [[ ! -e "$ACCOUNT_HOME/rules" ]] &&
+   [[ ! -L "$ACCOUNT_HOME/rules" ]]; then
+
+    ln -s "$SHARED_HOME/rules" "$ACCOUNT_HOME/rules"
+fi
+
+# ------------------------------------------------------------
+# 尝试识别显式 SESSION_ID
+#
+# 支持常见形式：
+#
+#   codex-account a resume UUID
+#
+#   codex-account a exec resume UUID "..."
+#
+# 如果检测到，则额外给该 session 加锁。
+# ------------------------------------------------------------
+
+SESSION_ACTION=""
+SESSION_ID=""
+
+for arg in "$@"; do
+    if [[ -z "$SESSION_ACTION" ]] && [[ "$arg" == "resume" || "$arg" == "fork" ]]; then
+        SESSION_ACTION="$arg"
+        continue
+    fi
+
+    if [[ -n "$SESSION_ACTION" ]] && [[ -z "$SESSION_ID" ]] &&
+       [[ "$arg" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        SESSION_ID="$arg"
+        continue
+    fi
+done
+
+
+# 分页 session 必须和完整的 history_base lineage 一起移动。同步工具会
+# 选择最长的相容副本、检测分叉，并通过同目录临时文件原子替换目标。
+if [[ -n "$SESSION_ID" ]]; then
+    [[ -x "$SYNC_BIN" ]] || die "找不到 session 同步工具: $SYNC_BIN"
+
+    SOURCE_HOMES=("$SHARED_HOME")
+    for candidate_home in "$ACCOUNTS_HOME"/*; do
+        [[ -d "$candidate_home" ]] || continue
+        SOURCE_HOMES+=("$candidate_home")
+    done
+
+fi
+
+
+# ------------------------------------------------------------
+# 启动信息
+# ------------------------------------------------------------
+
+echo "[codex-account] account=$ACCOUNT" >&2
+echo "[codex-account] CODEX_HOME=$ACCOUNT_HOME" >&2
+echo "[codex-account] account_sessions=$ACCOUNT_SESSIONS" >&2
+
+if [[ -n "$SESSION_ID" ]]; then
+    echo "[codex-account] session=$SESSION_ID" >&2
+fi
+
+# ------------------------------------------------------------
+# 启动 Codex
+#
+# 每个账号：
+#   CODEX_HOME=~/.codex-accounts/<account>
+#
+# provider 强制 OpenAI，不受普通 ~/.codex/config.toml
+# 中 example_provider provider 的影响。状态数据库保留在各账号自己的
+# CODEX_HOME，避免并发 Codex 争用同一 SQLite，并满足 fork 对 rollout
+# 必须位于 CODEX_HOME 内的安全校验。
+#
+# auth 强制 file store。
+# ------------------------------------------------------------
+
+CODEX_ARGS=(
+    -c 'model_provider="openai"'
+    -c 'cli_auth_credentials_store="file"'
+)
+
+if [[ -n "$SESSION_ID" ]]; then
+    exec "$SYNC_BIN" \
+        --lock-home "$LOCK_HOME" \
+        --log-prefix codex-account \
+        --session-action "$SESSION_ACTION" \
+        "$SESSION_ID" "$ACCOUNT_HOME" "${SOURCE_HOMES[@]}" -- \
+        env CODEX_HOME="$ACCOUNT_HOME" CODEX_ACCOUNT_WRAPPED=1 \
+        "$CODEX_BIN" "${CODEX_ARGS[@]}" "$@"
+fi
+
+exec env CODEX_HOME="$ACCOUNT_HOME" \
+    CODEX_ACCOUNT_WRAPPED=1 \
+    "$CODEX_BIN" \
+    "${CODEX_ARGS[@]}" \
+    "$@"

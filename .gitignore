@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.*
+auth.json
+config.toml
+.codex/
+.codex-accounts/
+.codex-wrapper-backups/
+sessions/
+archived_sessions/
+backups/
+logs/
+*.jsonl
+*.sqlite*
+*.db
+*.db-*
+*.log
+*.pem
+*.key
+
+# Local notes and source material not intended for publication
+/Codex_session.md
+/Chat用法.md

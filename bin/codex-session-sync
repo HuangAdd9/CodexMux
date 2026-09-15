@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+"""Synchronize one Codex session and its paginated-history lineage.
+
+The script is intentionally narrow: wrappers provide a target CODEX_HOME and
+the possible source homes. Rollouts are copied atomically and only when the
+target is missing or is an exact, shorter prefix of the best source copy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+from contextlib import ExitStack, contextmanager
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+COPY_CHUNK_SIZE = 1024 * 1024
+MAX_LINEAGE_DEPTH = 64
+DAEMON_RPC_TIMEOUT = 15.0
+MAX_DAEMON_MESSAGE = 1024 * 1024
+
+
+class SyncError(RuntimeError):
+    """A session cannot be synchronized without risking data loss."""
+
+
+def parse_args() -> argparse.Namespace:
+    arguments = sys.argv[1:]
+    command = []
+    if "--" in arguments:
+        boundary = arguments.index("--")
+        command = arguments[boundary + 1:]
+        arguments = arguments[:boundary]
+    parser = argparse.ArgumentParser(
+        description="Synchronize a Codex rollout and its history lineage"
+    )
+    parser.add_argument("session_id", help="session UUID to synchronize")
+    parser.add_argument("target_home", type=Path, help="destination CODEX_HOME")
+    parser.add_argument(
+        "source_homes",
+        nargs="*",
+        type=Path,
+        help="CODEX_HOME directories to search for source rollouts",
+    )
+    parser.add_argument(
+        "--lock-home",
+        type=Path,
+        default=Path.home() / ".cache/codex-account/locks",
+        help="directory used for short-lived synchronization locks",
+    )
+    parser.add_argument(
+        "--log-prefix",
+        default="codex-session-sync",
+        help="prefix for synchronization messages",
+    )
+    parser.add_argument("--session-action", choices=("resume", "fork"), default="resume")
+    args = parser.parse_args(arguments)
+    args.command = command
+    return args
+
+
+def find_rollout(sessions_dir: Path, session_id: str) -> Path | None:
+    if not sessions_dir.is_dir():
+        return None
+
+    matches = sorted(sessions_dir.rglob(f"*-{session_id}.jsonl"))
+    if len(matches) > 1:
+        paths = ", ".join(str(path) for path in matches)
+        raise SyncError(f"multiple rollouts for {session_id} under {sessions_dir}: {paths}")
+    return matches[0] if matches else None
+
+
+def read_history_base(rollout: Path) -> dict | None:
+    try:
+        with rollout.open("r", encoding="utf-8") as handle:
+            metadata = json.loads(handle.readline())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SyncError(f"cannot read session metadata from {rollout}: {exc}") from exc
+
+    if metadata.get("type") != "session_meta":
+        raise SyncError(f"rollout first line is not session_meta: {rollout}")
+
+    payload = metadata.get("payload")
+    if not isinstance(payload, dict):
+        raise SyncError(f"invalid session_meta payload: {rollout}")
+
+    history_base = payload.get("history_base")
+    if history_base is None:
+        return None
+    if not isinstance(history_base, dict):
+        raise SyncError(f"invalid history_base: {rollout}")
+
+    parent_id = history_base.get("thread_id")
+    if parent_id is None:
+        return None
+    if not isinstance(parent_id, str) or not UUID_RE.fullmatch(parent_id):
+        raise SyncError(f"invalid history_base.thread_id: {rollout}")
+    for key, minimum in (("end_byte_offset", 1), ("end_ordinal_exclusive", 0)):
+        value = history_base.get(key)
+        if value is not None and (type(value) is not int or value < minimum):
+            raise SyncError(f"invalid history_base.{key}: {rollout}")
+    return history_base
+
+
+def read_parent_id(rollout: Path) -> str | None:
+    reference = read_history_base(rollout)
+    return reference["thread_id"] if reference else None
+
+
+def prefix_snapshot(path: Path, length: int) -> tuple[int, int, int, str]:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        metadata = os.fstat(handle.fileno())
+        if metadata.st_size < length:
+            raise SyncError(f"referenced parent history is incomplete: {path}")
+        handle.seek(length - 1)
+        if handle.read(1) != b"\n":
+            raise SyncError(f"history_base.end_byte_offset is not a record boundary: {path}")
+        handle.seek(0)
+        remaining = length
+        while remaining:
+            chunk = handle.read(min(COPY_CHUNK_SIZE, remaining))
+            if not chunk:
+                raise SyncError(f"referenced parent history was truncated: {path}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        current = path.stat()
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino) or current.st_size < length:
+            raise SyncError(f"referenced parent history changed during preflight: {path}")
+    return metadata.st_dev, metadata.st_ino, length, digest.hexdigest()
+
+
+def complete_local_parent(path: Path | None, reference: dict | None) -> bool:
+    if path is None or reference is None:
+        return False
+    boundary = reference.get("end_byte_offset")
+    if boundary is None or reference.get("end_ordinal_exclusive") is None:
+        return False
+    if path.stat().st_size < boundary:
+        return False
+    with path.open("rb") as handle:
+        header = handle.readline()
+    try:
+        metadata = json.loads(header)
+        identifier = metadata.get("payload", {}).get("id")
+        valid_id = isinstance(identifier, str) and identifier.lower() == reference["thread_id"].lower()
+        if metadata.get("type") != "session_meta" or not valid_id or len(header) > boundary:
+            raise SyncError(f"local parent metadata does not match history_base: {path}")
+    except (ValueError, AttributeError) as exc:
+        raise SyncError(f"invalid local parent metadata: {path}") from exc
+    return True
+
+
+def is_prefix(shorter: Path, longer: Path, length: int) -> bool:
+    remaining = length
+    with shorter.open("rb") as left, longer.open("rb") as right:
+        while remaining:
+            chunk_size = min(COPY_CHUNK_SIZE, remaining)
+            left_chunk = left.read(chunk_size)
+            if len(left_chunk) != chunk_size or left_chunk != right.read(chunk_size):
+                return False
+            remaining -= chunk_size
+    return True
+
+
+def unique_homes(target_home: Path, source_homes: list[Path]) -> list[Path]:
+    homes: list[Path] = []
+    seen: set[Path] = set()
+    for home in [target_home, *source_homes]:
+        resolved = home.expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        homes.append(resolved)
+    return homes
+
+
+def file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    metadata = path.stat()
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+@contextmanager
+def session_lock(lock_home: Path, session_id: str):
+    lock_home.mkdir(parents=True, exist_ok=True)
+    session_hash = hashlib.sha256(session_id.lower().encode()).hexdigest()
+    with (lock_home / f"session-{session_hash}.lock").open("a+b") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SyncError(f"session {session_id} is already in use by another wrapper") from exc
+        yield
+
+
+@contextmanager
+def native_writer_lock(home: Path, session_id: str):
+    directory = home / "thread-writer-locks"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{session_id}.lock"
+    with (directory / ".coordination.lock").open("a+b") as coordination:
+        try:
+            fcntl.flock(coordination, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SyncError(f"native writer coordination is busy in {home}; retry shortly") from exc
+        handle = path.open("a+b")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.close()
+            raise SyncError(f"session {session_id} has an active native writer in {home}") from exc
+        except OSError:
+            handle.close()
+            raise
+    try:
+        yield
+    finally:
+        try:
+            with (directory / ".coordination.lock").open("a+b") as coordination:
+                fcntl.flock(coordination, fcntl.LOCK_EX)
+                try:
+                    if path.stat().st_ino == os.fstat(handle.fileno()).st_ino:
+                        path.unlink()
+                except FileNotFoundError:
+                    pass
+                handle.close()
+        except OSError as exc:
+            print(f"codex-session-sync: could not clean up {path}: {exc}", file=sys.stderr)
+        finally:
+            handle.close()
+
+
+def native_writer_guard(home: Path, session_id: str, stack: ExitStack) -> ExitStack:
+    lifetime = stack.enter_context(ExitStack())
+    lifetime.enter_context(native_writer_lock(home, session_id))
+    return lifetime
+
+
+def choose_source(
+    session_id: str,
+    target_rollout: Path | None,
+    homes: list[Path],
+) -> Path | None:
+    candidates = [
+        rollout
+        for home in homes
+        if (rollout := find_rollout(home / "sessions", session_id)) is not None
+    ]
+    if not candidates:
+        return None
+
+    snapshots = {candidate: file_identity(candidate) for candidate in candidates}
+    source = max(candidates, key=lambda path: snapshots[path][2])
+    source_size = snapshots[source][2]
+
+    for candidate in candidates:
+        if candidate.samefile(source):
+            continue
+        candidate_size = snapshots[candidate][2]
+        prefix_size = min(candidate_size, source_size)
+        if not is_prefix(candidate, source, prefix_size):
+            raise SyncError(
+                f"divergent copies of session {session_id}: {candidate} and {source}; "
+                "histories differ, not a stale lock. Back up both branches before choosing one"
+            )
+    if any(file_identity(path) != snapshot for path, snapshot in snapshots.items()):
+        raise SyncError(f"session {session_id} changed during comparison; retry after its writer exits")
+    if target_rollout is not None and snapshots[target_rollout][2] == source_size:
+        return target_rollout
+    return source
+
+
+def copy_atomically(source: Path, destination: Path) -> None:
+    source_identity = file_identity(source)
+    source_size = source_identity[2]
+    destination_identity = file_identity(destination) if destination.exists() else None
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".importing", dir=destination.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as output, source.open("rb") as input_file:
+            shutil.copyfileobj(input_file, output, length=COPY_CHUNK_SIZE)
+            output.flush()
+            os.fsync(output.fileno())
+
+        if file_identity(source) != source_identity:
+            raise SyncError(f"source rollout changed while copying: {source}")
+        if temporary.stat().st_size != source_size:
+            raise SyncError(f"incomplete rollout copy: {source}")
+
+        shutil.copystat(source, temporary, follow_symlinks=True)
+        current_destination = file_identity(destination) if destination.exists() else None
+        if current_destination != destination_identity:
+            raise SyncError(f"destination rollout changed while copying: {destination}")
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def relative_rollout_path(source: Path, homes: list[Path]) -> Path:
+    for home in homes:
+        sessions_dir = home / "sessions"
+        try:
+            return source.relative_to(sessions_dir)
+        except ValueError:
+            continue
+    raise SyncError(f"source rollout is outside known session roots: {source}")
+
+
+def synchronize(args: argparse.Namespace) -> None:
+    if not UUID_RE.fullmatch(args.session_id):
+        raise SyncError(f"invalid session UUID: {args.session_id}")
+
+    target_home = args.target_home.expanduser().resolve()
+    target_sessions = target_home / "sessions"
+    target_sessions.mkdir(parents=True, exist_ok=True)
+    homes = unique_homes(target_home, args.source_homes)
+
+    args.lock_home.mkdir(parents=True, exist_ok=True)
+    target_hash = hashlib.sha256(str(target_home).encode()).hexdigest()
+    lock_path = args.lock_home / f"home-sync-{target_hash}.lock"
+
+    with ExitStack() as lineage_locks, lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        current_id: str | None = args.session_id
+        seen_ids: set[str] = set()
+        copies = []
+        snapshots = {}
+        bounded_parents = {}
+        parent_reference = None
+        local_lineage = True
+
+        for _depth in range(MAX_LINEAGE_DEPTH):
+            if current_id is None:
+                break
+            if current_id in seen_ids:
+                raise SyncError(f"lineage cycle detected at session {current_id}")
+            seen_ids.add(current_id)
+            target_rollout = find_rollout(target_sessions, current_id)
+            local_parent = (current_id != args.session_id and local_lineage
+                            and complete_local_parent(target_rollout, parent_reference))
+            if local_parent:
+                source = target_rollout
+                boundary = parent_reference["end_byte_offset"]
+                bounded_parents[source] = prefix_snapshot(source, boundary)
+            else:
+                if current_id != args.session_id:
+                    lineage_locks.enter_context(session_lock(args.lock_home, current_id))
+                    for home in homes:
+                        native_writer_guard(home, current_id, lineage_locks)
+                source = choose_source(current_id, target_rollout, homes)
+            if source is None:
+                if current_id == args.session_id:
+                    return
+                raise SyncError(
+                    f"session {args.session_id} is missing lineage rollout {current_id}"
+                )
+
+            if source != target_rollout:
+                if target_rollout is not None:
+                    destination = target_rollout
+                else:
+                    relative_path = relative_rollout_path(source, homes)
+                    destination = target_sessions / relative_path
+                copies.append((current_id, source, destination))
+            if not local_parent:
+                snapshots[source] = file_identity(source)
+            local_lineage = local_lineage and source == target_rollout
+            parent_reference = read_history_base(source)
+            current_id = parent_reference["thread_id"].lower() if parent_reference else None
+        else:
+            raise SyncError(
+                f"session {args.session_id} lineage exceeds {MAX_LINEAGE_DEPTH} levels"
+            )
+
+        for source, snapshot in snapshots.items():
+            if file_identity(source) != snapshot:
+                raise SyncError(f"lineage changed during preflight: {source}")
+        for source, snapshot in bounded_parents.items():
+            if prefix_snapshot(source, snapshot[2]) != snapshot:
+                raise SyncError(f"referenced parent prefix changed during preflight: {source}")
+        for current_id, source, destination in reversed(copies):
+            copy_atomically(source, destination)
+            print(
+                f"[{args.log_prefix}] imported_session={current_id}",
+                file=sys.stderr,
+            )
+            print(f"[{args.log_prefix}] imported_from={source}", file=sys.stderr)
+        for source, snapshot in bounded_parents.items():
+            print(f"[{args.log_prefix}] local_parent_prefix={source.name} bytes={snapshot[2]} (read-only)",
+                  file=sys.stderr)
+
+
+def run_command(command: list[str]) -> int:
+    child = subprocess.Popen(command, close_fds=True)
+    previous_handlers = {}
+
+    def forward_signal(signum, _frame):
+        try:
+            child.send_signal(signum)
+        except ProcessLookupError:
+            pass
+
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            previous_handlers[signum] = signal.signal(signum, forward_signal)
+        returncode = child.wait()
+        return returncode if returncode >= 0 else 128 - returncode
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
+def interactive_resume_index(command: list[str]) -> int | None:
+    if not command:
+        return None
+    position = 0
+    if Path(command[0]).name == "env":
+        position = 1
+        while position < len(command) and re.match(r"^[A-Za-z_][A-Za-z_0-9]*=", command[position]):
+            position += 1
+    position += 1
+    value_options = {
+        "-c", "--config", "-m", "--model", "-p", "--profile",
+        "-C", "--cd", "-s", "--sandbox", "-a", "--ask-for-approval",
+        "--enable", "--disable", "--add-dir", "-i", "--image", "--local-provider",
+    }
+    flag_options = {
+        "--search", "--no-alt-screen", "--oss", "--approve-for-me",
+        "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust",
+        "--strict-config", "--worktree",
+    }
+    if any(argument == "--remote" or argument.startswith("--remote=")
+           for argument in command[position:]):
+        return None
+    while position < len(command):
+        argument = command[position]
+        if argument in value_options:
+            position += 2
+        elif argument in flag_options or argument.split("=", 1)[0] in value_options:
+            position += 1
+        else:
+            return position if argument == "resume" else None
+    return None
+
+
+def local_daemon_writer(home: Path, session_id: str) -> tuple[int, Path] | None:
+    endpoint = home / "app-server-control/app-server-control.sock"
+    lock_path = home / "thread-writer-locks" / f"{session_id}.lock"
+    try:
+        metadata = lock_path.stat()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(1.0)
+            connection.connect(str(endpoint))
+            credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            daemon_pid, daemon_uid, _group = struct.unpack("3i", credentials)
+        if daemon_uid != os.getuid():
+            return None
+        if b"app-server" not in Path(f"/proc/{daemon_pid}/cmdline").read_bytes().split(b"\0"):
+            return None
+        expected_identity = (os.major(metadata.st_dev), os.minor(metadata.st_dev), metadata.st_ino)
+        for line in Path("/proc/locks").read_text().splitlines():
+            fields = line.split()
+            if len(fields) != 8 or fields[1:4] != ["FLOCK", "ADVISORY", "WRITE"]:
+                continue
+            major, minor, inode = fields[5].split(":")
+            identity = (int(major, 16), int(minor, 16), int(inode))
+            if int(fields[4]) == daemon_pid and identity == expected_identity:
+                return daemon_pid, endpoint
+    except (OSError, AttributeError, ValueError):
+        return None
+    return None
+
+
+class DaemonClient:
+    """Bounded JSON-RPC over the local daemon's Unix WebSocket, without dependencies."""
+
+    def __init__(self, endpoint: Path, expected_pid: int):
+        self.endpoint = endpoint
+        self.expected_pid = expected_pid
+        self.connection = None
+        self.request_id = 0
+        self.deadline = 0.0
+
+    def __enter__(self):
+        self.connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.connection.settimeout(DAEMON_RPC_TIMEOUT)
+            self.connection.connect(str(self.endpoint))
+            credentials = self.connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            peer_pid, peer_uid, _group = struct.unpack("3i", credentials)
+            if peer_pid != self.expected_pid or peer_uid != os.getuid():
+                raise SyncError("daemon identity changed before provider verification; retry")
+            self.deadline = time.monotonic() + DAEMON_RPC_TIMEOUT
+            nonce = base64.b64encode(os.urandom(16)).decode("ascii")
+            self.connection.sendall((
+                "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+                "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
+                f"Sec-WebSocket-Key: {nonce}\r\n\r\n"
+            ).encode("ascii"))
+            header = bytearray()
+            while not header.endswith(b"\r\n\r\n") and len(header) < 16384:
+                header.extend(self.receive_exactly(1))
+            lines = bytes(header).decode("latin1").split("\r\n")
+            expected_accept = base64.b64encode(hashlib.sha1(
+                (nonce + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+            ).digest()).decode("ascii")
+            headers = {name.lower(): value.strip() for line in lines[1:] if ":" in line
+                       for name, value in [line.split(":", 1)]}
+            if (not header.endswith(b"\r\n\r\n") or lines[0].split()[1:2] != ["101"]
+                    or headers.get("sec-websocket-accept") != expected_accept):
+                raise SyncError("daemon WebSocket handshake failed; refusing unverified provider")
+            self.request("initialize", {
+                "clientInfo": {"name": "codex_account_wrapper", "version": "1.0"},
+                "capabilities": {"experimentalApi": True},
+            })
+            self.send_frame(json.dumps({"method": "initialized"}).encode())
+            return self
+        except BaseException:
+            self.connection.close()
+            raise
+
+    def __exit__(self, *_exception):
+        self.connection.close()
+
+    def receive_exactly(self, length: int) -> bytes:
+        data = bytearray()
+        while len(data) < length:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise SyncError("daemon provider verification timed out")
+            self.connection.settimeout(remaining)
+            chunk = self.connection.recv(length - len(data))
+            if not chunk:
+                raise SyncError("daemon disconnected during provider verification")
+            data.extend(chunk)
+        return bytes(data)
+
+    def send_frame(self, payload: bytes, opcode: int = 1):
+        if len(payload) > MAX_DAEMON_MESSAGE:
+            raise SyncError("daemon message exceeds size limit")
+        mask = os.urandom(4)
+        prefix = bytes([0x80 | opcode])
+        if len(payload) < 126:
+            prefix += bytes([0x80 | len(payload)])
+        else:
+            prefix += b"\xfe" + struct.pack("!H", len(payload)) if len(payload) <= 65535 else (
+                b"\xff" + struct.pack("!Q", len(payload)))
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        self.connection.settimeout(max(0.001, self.deadline - time.monotonic()))
+        self.connection.sendall(prefix + mask + masked)
+
+    def receive_message(self) -> dict:
+        message = bytearray()
+        started = False
+        while True:
+            first, second = self.receive_exactly(2)
+            opcode = first & 0x0F
+            length = second & 0x7F
+            if first & 0x70 or second & 0x80:
+                raise SyncError("unsupported daemon WebSocket frame")
+            if length == 126:
+                length = struct.unpack("!H", self.receive_exactly(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self.receive_exactly(8))[0]
+            if length + len(message) > MAX_DAEMON_MESSAGE:
+                raise SyncError("daemon response exceeds size limit")
+            if opcode >= 8 and (not first & 0x80 or length > 125):
+                raise SyncError("invalid daemon control frame")
+            payload = self.receive_exactly(length)
+            if opcode == 8:
+                raise SyncError("daemon closed provider verification connection")
+            if opcode == 9:
+                self.send_frame(payload, opcode=10)
+                continue
+            if opcode == 10:
+                continue
+            if opcode != (0 if started else 1):
+                raise SyncError("invalid daemon message continuation")
+            started = True
+            message.extend(payload)
+            if first & 0x80:
+                try:
+                    result = json.loads(message)
+                except (ValueError, UnicodeDecodeError) as exc:
+                    raise SyncError("invalid daemon JSON response") from exc
+                if not isinstance(result, dict):
+                    raise SyncError("invalid daemon response type")
+                return result
+
+    def request(self, method: str, params: dict) -> dict:
+        self.request_id += 1
+        self.deadline = time.monotonic() + DAEMON_RPC_TIMEOUT
+        self.send_frame(json.dumps({"id": self.request_id, "method": method, "params": params}).encode())
+        while True:
+            response = self.receive_message()
+            if "method" in response or response.get("id") != self.request_id:
+                continue
+            if "error" in response:
+                error = response["error"]
+                detail = str(error.get("message", "unknown RPC error"))[:500] if isinstance(error, dict) else "invalid RPC error"
+                raise SyncError(f"daemon rejected {method}: {detail}; provider was not verified")
+            if not isinstance(response.get("result"), dict):
+                raise SyncError(f"invalid daemon {method} result")
+            return response["result"]
+
+
+def requested_model_provider(command: list[str]) -> str | None:
+    provider = None
+    position = 0
+    while position < len(command):
+        argument = command[position]
+        position += 1
+        if argument == "--":
+            break
+        if argument in ("-c", "--config") and position < len(command):
+            assignment = command[position]
+            position += 1
+        elif argument.startswith("--config="):
+            assignment = argument[len("--config="):]
+        elif argument.startswith("-c") and len(argument) > 2:
+            assignment = argument[2:]
+        else:
+            continue
+        match = re.fullmatch(r"\s*model_provider\s*=\s*(.*?)\s*", assignment)
+        if match:
+            value = match[1]
+            try:
+                provider = json.loads(value) if value.startswith('"') else value.strip("'")
+            except ValueError as exc:
+                raise SyncError("invalid model_provider override") from exc
+            if not isinstance(provider, str) or not provider:
+                raise SyncError("model_provider must be a nonempty string")
+    return provider
+
+
+@contextmanager
+def ensure_daemon_provider(endpoint: Path, daemon_pid: int, session_id: str, provider: str):
+    """Verify the provider and retain the subscription while the TUI takes over."""
+    with DaemonClient(endpoint, daemon_pid) as client:
+        params = {"threadId": session_id, "excludeTurns": True}
+        thread = client.request("thread/read", {"threadId": session_id, "includeTurns": False})["thread"]
+        status = thread.get("status", {}).get("type")
+        can_override = status in ("idle", "systemError", "notLoaded")
+        current = client.request("thread/resume", dict(params, modelProvider=provider) if can_override else params)
+        if current.get("modelProvider") != provider and not can_override:
+            raise SyncError(
+                f"session {session_id} is {status}; cannot change provider "
+                f"from {current.get('modelProvider')} to {provider} while active. "
+                "Stop or finish that turn first; no task was interrupted by this wrapper"
+            )
+        verified = client.request("thread/resume", params)
+        if current.get("modelProvider") != provider or verified.get("modelProvider") != provider:
+            raise SyncError(
+                f"daemon did not apply requested provider {provider}; "
+                f"actual={verified.get('modelProvider')}. Refusing to launch with the wrong provider"
+            )
+        yield
+
+
+def synchronize_and_run(args: argparse.Namespace) -> int:
+    if not UUID_RE.fullmatch(args.session_id):
+        raise SyncError(f"invalid session UUID: {args.session_id}")
+    args.session_id = args.session_id.lower()
+    homes = unique_homes(args.target_home, args.source_homes)
+    target_home = homes[0]
+    with ExitStack() as guards:
+        guards.enter_context(session_lock(args.lock_home, args.session_id))
+        resume_index = interactive_resume_index(args.command)
+        daemon = (local_daemon_writer(target_home, args.session_id)
+                  if args.session_action == "resume" and resume_index is not None else None)
+        if daemon is not None:
+            daemon_pid, endpoint = daemon
+            for home in homes[1:]:
+                native_writer_guard(home, args.session_id, guards)
+            provider = requested_model_provider(args.command)
+            if provider is not None:
+                guards.enter_context(ensure_daemon_provider(endpoint, daemon_pid, args.session_id, provider))
+                print(f"[{args.log_prefix}] verified_runtime_provider={provider}", file=sys.stderr)
+            command = args.command.copy()
+            command[resume_index + 1:resume_index + 1] = ["--remote", f"unix://{endpoint}"]
+            print(
+                f"[{args.log_prefix}] reattach_session={args.session_id} daemon_pid={daemon_pid}\n"
+                f"[{args.log_prefix}] existing daemon context; no history synchronization. "
+                "Other model/cwd overrides remain subject to native Codex support.",
+                file=sys.stderr,
+            )
+            return run_command(command)
+        native_guards = {
+            home: native_writer_guard(home, args.session_id, guards) for home in homes
+        }
+        synchronize(args)
+        if not args.command:
+            return 0
+        if args.session_action == "fork":
+            guards.close()
+        else:
+            native_guards[target_home].close()
+        return run_command(args.command)
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        return synchronize_and_run(args)
+    except (OSError, SyncError) as exc:
+        print(f"{args.log_prefix}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

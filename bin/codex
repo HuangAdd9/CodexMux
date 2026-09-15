@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+SHARED_HOME="${CODEX_SHARED_HOME:-$HOME/.codex}"
+ACCOUNTS_HOME="${CODEX_ACCOUNTS_HOME:-$HOME/.codex-accounts}"
+LOCK_HOME="${CODEX_ACCOUNT_LOCK_HOME:-$HOME/.cache/codex-account/locks}"
+SYNC_BIN="${CODEX_SESSION_SYNC_BIN:-$HOME/bin/codex-session-sync}"
+
+
+die() {
+    echo "codex wrapper: $*" >&2
+    exit 1
+}
+
+
+find_real_codex() {
+    local self candidate candidate_version resolved path_dir fallback fallback_version
+    local -a path_dirs
+
+    self="$(readlink -f "$0")"
+    fallback=""
+    fallback_version=""
+    IFS=: read -r -a path_dirs <<< "${PATH:-}"
+
+    for path_dir in "${path_dirs[@]}"; do
+        [[ -n "$path_dir" ]] || path_dir="."
+        candidate="$path_dir/codex"
+        [[ -x "$candidate" ]] || continue
+
+        resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
+        if [[ -n "$resolved" ]] && [[ "$resolved" != "$self" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    # 非交互 SSH 不一定加载 NVM。优先查找 npm 包内的原生二进制，
+    # 避免 JS shim 意外使用系统自带的旧 Node.js。
+    while IFS= read -r candidate; do
+        [[ -x "$candidate" ]] || continue
+        resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
+        if [[ -n "$resolved" ]] && [[ "$resolved" != "$self" ]]; then
+            candidate_version="$("$candidate" --version 2>/dev/null | awk '{print $2}')"
+            [[ -n "$candidate_version" ]] || continue
+            if [[ -z "$fallback_version" ]] ||
+               [[ "$(printf '%s\n%s\n' "$fallback_version" "$candidate_version" | sort -V | tail -n1)" == "$candidate_version" ]]; then
+                fallback="$candidate"
+                fallback_version="$candidate_version"
+            fi
+        fi
+    done < <(
+        find \
+            "$HOME/.npm-global/lib/node_modules/@openai/codex" \
+            "$HOME/.local/lib/node_modules/@openai/codex" \
+            "$HOME/.nvm/versions/node" \
+            -type f -path '*/vendor/*/bin/codex' -print 2>/dev/null | sort -V
+    )
+
+    if [[ -n "$fallback" ]]; then
+        printf '%s\n' "$fallback"
+        return 0
+    fi
+
+    # 少数安装方式只有 JS shim；此时仍保留常见位置回退。
+    for candidate in \
+        "$HOME/.npm-global/bin/codex" \
+        "$HOME/.local/bin/codex"; do
+        [[ -x "$candidate" ]] || continue
+        resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
+        if [[ -n "$resolved" ]] && [[ "$resolved" != "$self" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+
+REAL_CODEX="${CODEX_REAL_BIN:-}"
+if [[ -z "$REAL_CODEX" ]]; then
+    REAL_CODEX="$(find_real_codex)" || die "找不到原始 codex 可执行文件"
+fi
+
+[[ -x "$REAL_CODEX" ]] || die "原始 codex 不可执行: $REAL_CODEX"
+
+# codex-account 已经完成账号目录选择和会话锁定，不能重复处理。
+if [[ "${CODEX_ACCOUNT_WRAPPED:-0}" == "1" ]]; then
+    unset CODEX_ACCOUNT_WRAPPED
+    exec "$REAL_CODEX" "$@"
+fi
+
+
+SESSION_ACTION=""
+SESSION_ID=""
+EXPLICIT_PROVIDER=""
+PROVIDER_OVERRIDE_SEEN=0
+
+
+read_config_override() {
+    local assignment="$1"
+    local value
+
+    if [[ "$assignment" =~ ^[[:space:]]*model_provider[[:space:]]*=(.*)$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+
+        if (( ${#value} >= 2 )); then
+            if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]] ||
+               [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+                value="${value:1:${#value}-2}"
+            fi
+        fi
+
+        EXPLICIT_PROVIDER="$value"
+        PROVIDER_OVERRIDE_SEEN=1
+    fi
+}
+
+
+expect_config_value=0
+
+for arg in "$@"; do
+    if (( expect_config_value )); then
+        read_config_override "$arg"
+        expect_config_value=0
+    else
+        case "$arg" in
+            -c|--config)
+                expect_config_value=1
+                ;;
+            --config=*)
+                read_config_override "${arg#--config=}"
+                ;;
+        esac
+    fi
+
+    if [[ -z "$SESSION_ACTION" ]] && [[ "$arg" == "resume" || "$arg" == "fork" ]]; then
+        SESSION_ACTION="$arg"
+        continue
+    fi
+
+    if [[ -n "$SESSION_ACTION" ]] && [[ -z "$SESSION_ID" ]] &&
+       [[ "$arg" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        SESSION_ID="$arg"
+        continue
+    fi
+done
+
+if [[ -z "$SESSION_ID" ]]; then
+    exec env CODEX_HOME="${CODEX_HOME:-$SHARED_HOME}" "$REAL_CODEX" "$@"
+fi
+
+# An explicitly supplied CODEX_HOME is authoritative. This also keeps the
+# wrapper composable with external launchers that manage their own state.
+sync_and_exec() {
+    local destination_home="$1"
+    shift
+    local -a source_homes=("$SHARED_HOME")
+    local candidate_home
+    for candidate_home in "$ACCOUNTS_HOME"/*; do
+        [[ -d "$candidate_home" ]] || continue
+        source_homes+=("$candidate_home")
+    done
+    [[ -x "$SYNC_BIN" ]] || die "找不到 session 同步工具: $SYNC_BIN"
+    exec "$SYNC_BIN" \
+        --lock-home "$LOCK_HOME" --log-prefix codex \
+        --session-action "$SESSION_ACTION" \
+        "$SESSION_ID" "$destination_home" "${source_homes[@]}" -- \
+        env CODEX_HOME="$destination_home" "$REAL_CODEX" "$@"
+}
+
+if [[ "${CODEX_HOME+x}" == "x" ]]; then
+    sync_and_exec "$CODEX_HOME" "$@"
+fi
+
+echo "[codex] routed_session=$SESSION_ID" >&2
+if (( PROVIDER_OVERRIDE_SEEN )); then
+    echo "[codex] routed_provider=$EXPLICIT_PROVIDER" >&2
+fi
+echo "[codex] routed_home=$SHARED_HOME" >&2
+sync_and_exec "$SHARED_HOME" "$@"
