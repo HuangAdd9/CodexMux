@@ -8,13 +8,15 @@ CodexMux provides experimental Linux wrappers for account-isolated Codex CLI ses
 
 Open-source under the Apache License 2.0. No accounts, credentials, production conversations, or operational databases are included.
 
-The snapshot has 44 regression tests. Earlier manual integration checks used Codex CLI 0.154.0 with an app server at 0.153.0. These observations are not a compatibility guarantee for other releases. The wrappers depend on internal history and app-server details that can change.
+The snapshot has 53 regression tests. The current compatibility check uses Codex CLI 0.156.1; earlier daemon reattachment checks also covered an app server at 0.153.0. These observations are not a compatibility guarantee for other releases. The wrappers depend on internal history and app-server details that can change.
 
 ## Features
 
 - Create separate account homes without logging in; authentication remains handled by Codex.
+- Show the live ChatGPT Codex limit windows for every logged-in account.
 - Run different sessions concurrently, including sessions using the same account.
 - Find an explicit session UUID across local account homes and import compatible history.
+- Recognize compatible legacy and paginated copies by stable history IDs when their byte layouts differ.
 - Import required `history_base` ancestors without replacing divergent branches.
 - Coordinate explicit session access across cooperating wrappers on the same machine.
 - Reattach an eligible detached interactive session to its verified local app server.
@@ -24,6 +26,7 @@ The snapshot has 44 regression tests. Earlier manual integration checks used Cod
 
 ```text
 bin/codex-account       Account selection and isolated CODEX_HOME
+bin/codex-account-limits Concurrent ChatGPT Codex limit queries
 bin/codex-session-sync  History synchronization, locks, daemon reattachment
 bin/codex               Optional transparent routing of plain codex commands
 tests/                  Synthetic regression fixtures and mocked app servers
@@ -45,6 +48,7 @@ Keep the native Codex executable on PATH. From this repository, use a subshell s
 ```bash
 (
   export CODEX_SESSION_SYNC_BIN="$PWD/bin/codex-session-sync"
+  export CODEX_ACCOUNT_LIMITS_BIN="$PWD/bin/codex-account-limits"
   ./bin/codex-account --add personal
   ./bin/codex-account personal login --device-auth
   ./bin/codex-account personal login status
@@ -56,10 +60,22 @@ Creating `personal` only creates its directory. Login is a separate, explicit st
 ```bash
 (
   export CODEX_SESSION_SYNC_BIN="$PWD/bin/codex-session-sync"
+  export CODEX_ACCOUNT_LIMITS_BIN="$PWD/bin/codex-account-limits"
   ./bin/codex-account --list
+  ./bin/codex-account --lslimit
   ./bin/codex-account personal resume SESSION_ID
 )
 ```
+
+`--lslimit` queries the official Codex app-server `account/rateLimits/read`
+method for every account that has an `auth.json`. It prints each primary and
+secondary quota window with used percentage, remaining percentage and reset
+time in `Asia/Shanghai`. Accounts are queried concurrently (four at a time by default); a failed
+or expired account is reported without hiding successful results from other
+accounts. Set `CODEX_ACCOUNT_LIMIT_WORKERS` or
+`CODEX_ACCOUNT_LIMIT_TIMEOUT_SEC` to positive integers when the defaults are
+not suitable. The command is read-only with respect to quotas and does not
+consume a reset credit.
 
 Replace `SESSION_ID` with your own UUID. The default account home is `~/.codex-accounts/personal`; the shared history search home is `~/.codex`. The wrapper requests the `openai` provider and file-based authentication by default. An explicit later `-c model_provider=...` argument is preserved; it does not create the provider configuration or validate access to that provider.
 
@@ -90,13 +106,16 @@ Plain `codex` always uses the main home (`~/.codex` or `CODEX_SHARED_HOME`), unl
 | `CODEX_ACCOUNTS_HOME` | `~/.codex-accounts`; account homes |
 | `CODEX_ACCOUNT_LOCK_HOME` | `~/.cache/codex-account/locks`; shared local coordination locks |
 | `CODEX_SESSION_SYNC_BIN` | `~/bin/codex-session-sync`; synchronization helper |
+| `CODEX_ACCOUNT_LIMITS_BIN` | `~/bin/codex-account-limits`; account limit helper |
+| `CODEX_ACCOUNT_LIMIT_WORKERS` | `4`; concurrent account status requests |
+| `CODEX_ACCOUNT_LIMIT_TIMEOUT_SEC` | `20`; timeout per account in seconds |
 | `CODEX_REAL_BIN` | Explicit native executable for the optional router |
 
 Use explicit Codex arguments and configure the provider in the appropriate account home. Selecting a provider does not select a different account home.
 
 ## Safety boundaries and troubleshooting
 
-- **Divergent copies:** the tool refuses to merge different histories. A larger file or newer modification time is not proof that it contains all messages. Sequential use of stale copies can create divergence even without simultaneous writers. Back up all branches and inspect them before choosing a canonical copy.
+- **Divergent copies:** the tool refuses to merge independent histories. A larger file or newer modification time is not proof that it contains all messages. Known legacy and paginated layouts can be reconciled only when one logical history contains the other with matching shared records. Sequential use of stale copies can create a real branch even without simultaneous writers.
 - **Not continuous synchronization:** imports happen during supported explicit-ID operations, not after every message. Old copies can remain in other account homes.
 - **Active writer:** do not delete locks blindly. A detached native task may still run. Only verified supported local daemon reattachment is allowed; other conflicts fail closed.
 - **Provider switching:** idle daemon resume may be verified; active turns are not forcibly switched. Existing subagents and future in-session forks are not covered by this guarantee. Other remote settings such as working directory remain subject to native Codex behavior.

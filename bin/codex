@@ -15,12 +15,12 @@ die() {
 
 
 find_real_codex() {
-    local self candidate candidate_version resolved path_dir fallback fallback_version
+    local self candidate candidate_version resolved path_dir best best_version
     local -a path_dirs
 
     self="$(readlink -f "$0")"
-    fallback=""
-    fallback_version=""
+    best=""
+    best_version=""
     IFS=: read -r -a path_dirs <<< "${PATH:-}"
 
     for path_dir in "${path_dirs[@]}"; do
@@ -29,24 +29,29 @@ find_real_codex() {
         [[ -x "$candidate" ]] || continue
 
         resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
-        if [[ -n "$resolved" ]] && [[ "$resolved" != "$self" ]]; then
-            printf '%s\n' "$candidate"
-            return 0
+        [[ -n "$resolved" ]] && [[ "$resolved" != "$self" ]] || continue
+        candidate_version="$("$candidate" --version 2>/dev/null | awk '$1 == "codex-cli" {print $2; exit}')"
+        [[ "$candidate_version" =~ ^[0-9]+([.][0-9A-Za-z-]+)+$ ]] || continue
+        if [[ -z "$best_version" ]] ||
+           [[ "$(printf '%s\n%s\n' "$best_version" "$candidate_version" | sort -V | tail -n1)" == "$candidate_version" ]]; then
+            best="$candidate"
+            best_version="$candidate_version"
         fi
     done
 
-    # 非交互 SSH 不一定加载 NVM。优先查找 npm 包内的原生二进制，
-    # 避免 JS shim 意外使用系统自带的旧 Node.js。
+    # 非交互 SSH 不一定加载 NVM；同时扫描常见 npm 安装目录中的原生
+    # 二进制。所有候选统一按版本比较，避免 PATH 前面的项目内旧副本
+    # 抢占刚升级的全局 Codex。
     while IFS= read -r candidate; do
         [[ -x "$candidate" ]] || continue
         resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
         if [[ -n "$resolved" ]] && [[ "$resolved" != "$self" ]]; then
-            candidate_version="$("$candidate" --version 2>/dev/null | awk '{print $2}')"
-            [[ -n "$candidate_version" ]] || continue
-            if [[ -z "$fallback_version" ]] ||
-               [[ "$(printf '%s\n%s\n' "$fallback_version" "$candidate_version" | sort -V | tail -n1)" == "$candidate_version" ]]; then
-                fallback="$candidate"
-                fallback_version="$candidate_version"
+            candidate_version="$("$candidate" --version 2>/dev/null | awk '$1 == "codex-cli" {print $2; exit}')"
+            [[ "$candidate_version" =~ ^[0-9]+([.][0-9A-Za-z-]+)+$ ]] || continue
+            if [[ -z "$best_version" ]] ||
+               [[ "$(printf '%s\n%s\n' "$best_version" "$candidate_version" | sort -V | tail -n1)" == "$candidate_version" ]]; then
+                best="$candidate"
+                best_version="$candidate_version"
             fi
         fi
     done < <(
@@ -57,8 +62,8 @@ find_real_codex() {
             -type f -path '*/vendor/*/bin/codex' -print 2>/dev/null | sort -V
     )
 
-    if [[ -n "$fallback" ]]; then
-        printf '%s\n' "$fallback"
+    if [[ -n "$best" ]]; then
+        printf '%s\n' "$best"
         return 0
     fi
 

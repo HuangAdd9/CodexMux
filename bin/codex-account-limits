@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+
+import argparse
+import concurrent.futures
+import json
+import math
+import os
+from pathlib import Path
+import selectors
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+
+DEFAULT_WORKERS = 4
+DEFAULT_TIMEOUT_SECONDS = 20
+CLIENT_VERSION = "0.1.0"
+DISPLAY_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+class QueryError(Exception):
+    pass
+
+
+def positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def arguments():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--accounts-home", type=Path, required=True)
+    parser.add_argument("--codex-bin", type=Path, required=True)
+    parser.add_argument(
+        "--workers",
+        type=positive_int,
+        default=positive_int(os.environ.get("CODEX_ACCOUNT_LIMIT_WORKERS", DEFAULT_WORKERS)),
+    )
+    parser.add_argument(
+        "--timeout",
+        type=positive_int,
+        default=positive_int(
+            os.environ.get("CODEX_ACCOUNT_LIMIT_TIMEOUT_SEC", DEFAULT_TIMEOUT_SECONDS)
+        ),
+    )
+    return parser.parse_args()
+
+
+def logged_in_accounts(accounts_home):
+    if not accounts_home.is_dir():
+        return []
+    return sorted(
+        path.parent
+        for path in accounts_home.glob("*/auth.json")
+        if path.is_file() and not path.parent.is_symlink()
+    )
+
+
+def stop_process(process):
+    if process.poll() is not None:
+        return
+    if process.stdin is not None and not process.stdin.closed:
+        process.stdin.close()
+    try:
+        process.wait(timeout=1)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=2)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=2)
+
+
+def send_message(process, message):
+    process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+    process.stdin.flush()
+
+
+def read_response(process, request_id, deadline):
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise QueryError("request timed out")
+            events = selector.select(remaining)
+            if not events:
+                raise QueryError("request timed out")
+            line = process.stdout.readline()
+            if not line:
+                code = process.poll()
+                detail = f" (exit {code})" if code is not None else ""
+                raise QueryError(f"app-server closed before replying{detail}")
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") == request_id:
+                return message
+    finally:
+        selector.close()
+
+
+def result_or_error(response, operation):
+    if "error" not in response:
+        return response.get("result")
+    error = response["error"]
+    if isinstance(error, dict):
+        code = error.get("code", "unknown")
+        message = str(error.get("message", "request failed")).replace("\n", " ")[:120]
+        if "401 Unauthorized" in message:
+            raise QueryError("need login again")
+        raise QueryError(f"{operation} RPC {code}: {message}")
+    raise QueryError(f"{operation} request failed")
+
+
+def query_account(account_home, codex_bin, timeout):
+    environment = os.environ.copy()
+    environment["CODEX_HOME"] = str(account_home)
+    environment["CODEX_ACCOUNT_WRAPPED"] = "1"
+    process = subprocess.Popen(
+        [
+            str(codex_bin),
+            "-c",
+            'model_provider="openai"',
+            "-c",
+            'cli_auth_credentials_store="file"',
+            "app-server",
+            "--stdio",
+        ],
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout
+    try:
+        send_message(
+            process,
+            {
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {
+                        "name": "codex_account_limits",
+                        "title": "CodexMux account limits",
+                        "version": CLIENT_VERSION,
+                    }
+                },
+            },
+        )
+        result_or_error(read_response(process, 1, deadline), "initialize")
+        send_message(process, {"method": "initialized", "params": {}})
+        send_message(process, {"method": "account/rateLimits/read", "id": 2})
+        response = read_response(process, 2, deadline)
+    finally:
+        stop_process(process)
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                stream.close()
+
+    result = result_or_error(response, "rate-limit")
+    if not isinstance(result, dict):
+        raise QueryError("invalid rate-limit response")
+    return result
+
+
+def display_window(minutes):
+    if not isinstance(minutes, (int, float)) or minutes <= 0:
+        return "-"
+    minutes = int(minutes)
+    if minutes % 10080 == 0:
+        return f"{minutes // 10080}w"
+    if minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+
+def display_percent(value):
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        return "-"
+    return f"{value:g}%"
+
+
+def display_reset(timestamp):
+    if not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
+        return "-"
+    try:
+        return datetime.fromtimestamp(timestamp, DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M %Z")
+    except (OSError, OverflowError, ValueError):
+        return "-"
+
+
+def rows_for_result(account, result):
+    limits = result.get("rateLimitsByLimitId")
+    if not isinstance(limits, dict) or not limits:
+        single = result.get("rateLimits")
+        limits = {single.get("limitId", "codex"): single} if isinstance(single, dict) else {}
+    rows = []
+    for limit_id, limit in sorted(limits.items()):
+        if not isinstance(limit, dict):
+            continue
+        plan = limit.get("planType") or "-"
+        name = limit.get("limitName") or limit.get("limitId") or limit_id
+        for window_name in ("primary", "secondary"):
+            window = limit.get(window_name)
+            if not isinstance(window, dict):
+                continue
+            used = window.get("usedPercent")
+            remaining = 100 - used if isinstance(used, (int, float)) else None
+            rows.append(
+                [
+                    account,
+                    str(plan),
+                    str(name),
+                    window_name,
+                    display_window(window.get("windowDurationMins")),
+                    display_percent(used),
+                    display_percent(remaining),
+                    display_reset(window.get("resetsAt")),
+                ]
+            )
+    if not rows:
+        raise QueryError("account returned no rate-limit windows")
+    return rows
+
+
+def print_table(rows):
+    headers = ["ACCOUNT", "PLAN", "LIMIT", "BUCKET", "WINDOW", "USED", "LEFT", "RESET"]
+    widths = [max(len(row[index]) for row in [headers, *rows]) for index in range(len(headers))]
+    print("  ".join(value.ljust(widths[index]) for index, value in enumerate(headers)))
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+
+
+def main():
+    args = arguments()
+    accounts = logged_in_accounts(args.accounts_home)
+    if not accounts:
+        print("codex-account: 没有找到已登录账号。", file=sys.stderr)
+        return 1
+
+    results = {}
+    worker_count = min(args.workers, len(accounts))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(query_account, account, args.codex_bin, args.timeout): account
+            for account in accounts
+        }
+        for future in concurrent.futures.as_completed(futures):
+            account = futures[future]
+            try:
+                results[account.name] = (future.result(), None)
+            except (OSError, QueryError) as error:
+                results[account.name] = (None, str(error))
+
+    rows = []
+    failures = []
+    for account in sorted(results):
+        result, error = results[account]
+        if error is not None:
+            failures.append((account, error))
+            continue
+        try:
+            rows.extend(rows_for_result(account, result))
+        except QueryError as parse_error:
+            failures.append((account, str(parse_error)))
+
+    if rows:
+        print_table(rows)
+    for account, error in failures:
+        print(f"codex-account: {account}: {error}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

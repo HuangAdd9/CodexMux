@@ -15,6 +15,7 @@ ACCOUNTS_HOME="${CODEX_ACCOUNTS_HOME:-$HOME/.codex-accounts}"
 # wrapper 自己的锁
 LOCK_HOME="${CODEX_ACCOUNT_LOCK_HOME:-$HOME/.cache/codex-account/locks}"
 SYNC_BIN="${CODEX_SESSION_SYNC_BIN:-$HOME/bin/codex-session-sync}"
+LIMITS_BIN="${CODEX_ACCOUNT_LIMITS_BIN:-$HOME/bin/codex-account-limits}"
 
 
 die() {
@@ -28,10 +29,12 @@ usage() {
 Usage:
   codex-account --add <account>
   codex-account --list
+  codex-account --lslimit
   codex-account <account> [codex arguments...]
 
 Examples:
   codex-account --add newaccount
+  codex-account --lslimit
   codex-account newaccount login --device-auth
   codex-account personal
   codex-account a
@@ -42,6 +45,7 @@ Examples:
 Accounts:
   --add 仅创建独立账号目录，不登录、不复制认证；已有目录保持不变。
   --list 仅列出已有 auth.json 的账号。
+  --lslimit 并发查询所有已登录账号的 ChatGPT Codex 限额。
 
 Concurrency:
   不同账号 + 不同 session：可以并发
@@ -96,6 +100,16 @@ case "${1:-}" in
         sort
 
         exit 0
+        ;;
+
+    --lslimit)
+        [[ "$#" -eq 1 ]] || die "用法: codex-account --lslimit"
+        [[ -x "$LIMITS_BIN" ]] || die "找不到限额查询工具: $LIMITS_BIN"
+        command -v codex >/dev/null 2>&1 || die "找不到 codex"
+
+        exec "$LIMITS_BIN" \
+            --accounts-home "$ACCOUNTS_HOME" \
+            --codex-bin "$(command -v codex)"
         ;;
 
     -h|--help|"")

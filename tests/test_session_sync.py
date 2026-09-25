@@ -78,6 +78,34 @@ class SessionSyncTests(unittest.TestCase):
         path.write_text(json.dumps({"type": "session_meta", "payload": payload}) + "\n" + suffix)
         return path
 
+    def structured_rollout(self, home, records, session=SESSION, history_mode="legacy"):
+        path = home / "sessions/2026/09/09" / f"rollout-test-{session}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        metadata = {
+            "type": "session_meta",
+            "payload": {"id": session, "history_mode": history_mode},
+        }
+        lines = [metadata, *records]
+        path.write_text("".join(json.dumps(item) + "\n" for item in lines))
+        return path
+
+    @staticmethod
+    def response(identifier, text, include_null_content=False, ordinal=None):
+        payload = {"id": identifier, "type": "message", "text": text}
+        if include_null_content:
+            payload["content"] = None
+        item = {"type": "response_item", "payload": payload}
+        if ordinal is not None:
+            item["ordinal"] = ordinal
+        return item
+
+    @staticmethod
+    def turn_event(event_type, turn_id):
+        return {
+            "type": "event_msg",
+            "payload": {"type": event_type, "turn_id": turn_id},
+        }
+
     def command(self, target=None, session=SESSION, action="resume", execute=None):
         result = [str(HELPER), "--lock-home", str(self.locks),
                   "--session-action", action, session, str(target or self.target),
@@ -123,6 +151,101 @@ class SessionSyncTests(unittest.TestCase):
         self.assertEqual(identity, SYNC.file_identity(target))
         for home in (self.shared, self.target, self.other):
             self.assertEqual(list((home / "thread-writer-locks").glob(f"{SESSION}.lock")), [])
+
+    def test_logical_superset_reconciles_different_history_formats(self):
+        shared_records = [
+            self.response(f"item-{index}", f"text-{index}", ordinal=10**50 + index)
+            for index in range(12)
+        ]
+        target_compaction = {
+            "type": "compacted",
+            "payload": {
+                "compaction_response_id": "compaction-one",
+                "guardian_history": [{"type": "reasoning", "content": None}],
+            },
+        }
+        source_compaction = {
+            "type": "compacted",
+            "payload": {
+                "compaction_response_id": "compaction-one",
+                "guardian_history": [{"type": "reasoning"}],
+            },
+        }
+        target = self.structured_rollout(
+            self.target,
+            [
+                self.turn_event("task_started", "turn-one"),
+                *shared_records,
+                target_compaction,
+                self.turn_event("task_complete", "turn-one"),
+            ],
+            history_mode="paginated",
+        )
+        source = self.structured_rollout(
+            self.other,
+            [
+                self.response("ancestor-item", "ancestor"),
+                self.turn_event("task_started", "turn-one"),
+                *[
+                    self.response(f"item-{index}", f"text-{index}", include_null_content=True)
+                    for index in range(12)
+                ],
+                source_compaction,
+                self.turn_event("task_complete", "turn-one"),
+                self.turn_event("task_started", "turn-two"),
+                self.response("continuation-item", "continued"),
+                self.turn_event("task_complete", "turn-two"),
+            ],
+            history_mode="legacy",
+        )
+        self.assertGreater(target.stat().st_size, source.stat().st_size)
+
+        result = self.run_sync()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+
+    def test_logically_equivalent_formats_keep_target_copy(self):
+        target = self.structured_rollout(
+            self.target,
+            [self.response("item-one", "same", ordinal=123)],
+            history_mode="paginated",
+        )
+        self.structured_rollout(
+            self.other,
+            [self.response("item-one", "same", include_null_content=True)],
+            history_mode="legacy",
+        )
+        identity = SYNC.file_identity(target)
+
+        result = self.run_sync()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(identity, SYNC.file_identity(target))
+
+    def test_independent_logical_branches_are_rejected(self):
+        self.structured_rollout(
+            self.target,
+            [self.response("shared", "same"), self.response("left", "left branch")],
+        )
+        self.structured_rollout(
+            self.other,
+            [self.response("shared", "same"), self.response("right", "right branch")],
+        )
+
+        result = self.run_sync()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("divergent copies", result.stderr)
+
+    def test_shared_record_payload_mismatch_is_rejected(self):
+        self.structured_rollout(self.target, [self.response("shared", "left")])
+        self.structured_rollout(self.other, [self.response("shared", "right")])
+
+        result = self.run_sync()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("divergent copies", result.stderr)
 
     def test_symlink_source(self):
         source = self.rollout(self.shared)
@@ -366,6 +489,35 @@ class SessionSyncTests(unittest.TestCase):
             env=self.environment, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads((self.root / "launched.json").read_text())["home"], str(self.shared))
+
+    def test_router_prefers_newest_codex_candidate(self):
+        old_bin = self.root / "old-bin"
+        new_bin = self.root / "new-bin"
+        old_bin.mkdir()
+        new_bin.mkdir()
+        for directory, version in ((old_bin, "100.0.0"), (new_bin, "101.0.0")):
+            executable = directory / "codex"
+            executable.write_text(
+                "#!/bin/sh\n"
+                f"echo 'codex-cli {version}'\n"
+            )
+            executable.chmod(0o700)
+
+        environment = dict(self.environment)
+        environment.pop("CODEX_REAL_BIN")
+        environment["PATH"] = os.pathsep.join(
+            [str(old_bin), str(new_bin), "/usr/bin", "/bin"]
+        )
+        result = subprocess.run(
+            [str(BIN / "codex"), "--version"],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "codex-cli 101.0.0")
 
     def start_daemon(self, home, acquire_writer=True, provider="openai", status="idle", ignore_override=False):
         program = """

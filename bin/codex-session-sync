@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Synchronize one Codex session and its paginated-history lineage.
 
-The script is intentionally narrow: wrappers provide a target CODEX_HOME and
-the possible source homes. Rollouts are copied atomically and only when the
-target is missing or is an exact, shorter prefix of the best source copy.
+Wrappers provide a target CODEX_HOME and the possible source homes. Rollouts
+are copied atomically. Exact byte prefixes use a fast path; otherwise, known
+Codex JSONL records are compared by stable IDs so legacy and paginated copies
+of the same history are not mistaken for independent branches.
 """
 
 from __future__ import annotations
@@ -39,6 +40,22 @@ MAX_DAEMON_MESSAGE = 1024 * 1024
 
 class SyncError(RuntimeError):
     """A session cannot be synchronized without risking data loss."""
+
+
+class LogicalHistory:
+    """Stable records used to compare differently serialized rollouts."""
+
+    def __init__(
+        self,
+        record_ids: list[str],
+        digests: dict[str, str],
+        started_turns: set[str],
+        completed_turns: set[str],
+    ) -> None:
+        self.record_ids = tuple(record_ids)
+        self.digests = digests
+        self.started_turns = frozenset(started_turns)
+        self.completed_turns = frozenset(completed_turns)
 
 
 def parse_args() -> argparse.Namespace:
@@ -180,6 +197,166 @@ def is_prefix(shorter: Path, longer: Path, length: int) -> bool:
     return True
 
 
+def normalize_payload(value):
+    """Normalize missing versus null content fields across history formats."""
+
+    if isinstance(value, dict):
+        return {
+            key: normalize_payload(item)
+            for key, item in value.items()
+            if not (key == "content" and item is None)
+        }
+    if isinstance(value, list):
+        return [normalize_payload(item) for item in value]
+    return value
+
+
+def payload_digest(payload: dict) -> str:
+    """Hash semantic payload data while tolerating one known format change."""
+
+    normalized = normalize_payload(payload)
+    serialized = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def stable_record(item: dict) -> tuple[str, str] | None:
+    """Return a stable record ID and digest for history-bearing record types."""
+
+    record_type = item.get("type")
+    payload = item.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    if record_type == "response_item":
+        identifier = payload.get("id")
+        if not isinstance(identifier, str):
+            identifier = payload.get("call_id")
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError("response_item has no stable ID")
+        return f"response:{identifier}", payload_digest(payload)
+
+    if record_type == "compacted":
+        identifier = payload.get("compaction_response_id")
+        if isinstance(identifier, str) and identifier:
+            return f"compacted:{identifier}", payload_digest(payload)
+    return None
+
+
+def read_logical_history(path: Path, session_id: str) -> LogicalHistory:
+    """Read stable comparison data without retaining full JSONL payloads."""
+
+    record_ids: list[str] = []
+    digests: dict[str, str] = {}
+    started_turns: set[str] = set()
+    completed_turns: set[str] = set()
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                item = json.loads(line)
+                if not isinstance(item, dict):
+                    raise ValueError(f"line {line_number} is not a JSON object")
+
+                if line_number == 1:
+                    payload = item.get("payload")
+                    identifier = payload.get("id") if isinstance(payload, dict) else None
+                    if item.get("type") != "session_meta" or identifier != session_id:
+                        raise ValueError("first record does not match the session ID")
+
+                record = stable_record(item)
+                if record is not None:
+                    identifier, digest = record
+                    previous = digests.get(identifier)
+                    if previous is not None and previous != digest:
+                        raise ValueError(f"stable ID {identifier} has conflicting payloads")
+                    record_ids.append(identifier)
+                    digests[identifier] = digest
+
+                if item.get("type") == "event_msg":
+                    payload = item.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    turn_id = payload.get("turn_id")
+                    if not isinstance(turn_id, str) or not turn_id:
+                        continue
+                    if payload.get("type") == "task_started":
+                        started_turns.add(turn_id)
+                    elif payload.get("type") == "task_complete":
+                        completed_turns.add(turn_id)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise SyncError(f"cannot compare logical history in {path}: {exc}") from exc
+
+    if not record_ids:
+        raise SyncError(f"no stable history records in {path}")
+    return LogicalHistory(record_ids, digests, started_turns, completed_turns)
+
+
+def is_ordered_subsequence(shorter: tuple[str, ...], longer: tuple[str, ...]) -> bool:
+    """Return whether every shorter record occurs in order in longer."""
+
+    position = 0
+    for identifier in longer:
+        if position < len(shorter) and identifier == shorter[position]:
+            position += 1
+    return position == len(shorter)
+
+
+def logical_history_contains(longer: LogicalHistory, shorter: LogicalHistory) -> bool:
+    """Return whether longer safely contains every known part of shorter."""
+
+    if not shorter.started_turns.issubset(longer.started_turns):
+        return False
+    if not shorter.completed_turns.issubset(longer.completed_turns):
+        return False
+    for identifier, digest in shorter.digests.items():
+        if longer.digests.get(identifier) != digest:
+            return False
+    return is_ordered_subsequence(shorter.record_ids, longer.record_ids)
+
+
+def choose_logical_source(
+    session_id: str,
+    target_rollout: Path | None,
+    candidates: list[Path],
+    snapshots: dict[Path, tuple[int, int, int, int, int]],
+) -> Path | None:
+    """Choose a single history that semantically contains all other copies."""
+
+    try:
+        histories = {
+            candidate: read_logical_history(candidate, session_id)
+            for candidate in candidates
+        }
+    except SyncError:
+        return None
+
+    complete = [
+        candidate
+        for candidate in candidates
+        if all(
+            logical_history_contains(histories[candidate], histories[other])
+            for other in candidates
+        )
+    ]
+    if not complete:
+        return None
+    if target_rollout in complete:
+        return target_rollout
+    return max(
+        complete,
+        key=lambda path: (
+            len(histories[path].record_ids),
+            snapshots[path][3],
+            str(path),
+        ),
+    )
+
+
 def unique_homes(target_home: Path, source_homes: list[Path]) -> list[Path]:
     homes: list[Path] = []
     seen: set[Path] = set()
@@ -267,23 +444,28 @@ def choose_source(
         return None
 
     snapshots = {candidate: file_identity(candidate) for candidate in candidates}
-    source = max(candidates, key=lambda path: snapshots[path][2])
-    source_size = snapshots[source][2]
+    byte_source = max(candidates, key=lambda path: snapshots[path][2])
+    source_size = snapshots[byte_source][2]
+    byte_compatible = all(
+        candidate.samefile(byte_source)
+        or is_prefix(candidate, byte_source, min(snapshots[candidate][2], source_size))
+        for candidate in candidates
+    )
 
-    for candidate in candidates:
-        if candidate.samefile(source):
-            continue
-        candidate_size = snapshots[candidate][2]
-        prefix_size = min(candidate_size, source_size)
-        if not is_prefix(candidate, source, prefix_size):
+    if byte_compatible:
+        source = byte_source
+        if target_rollout is not None and snapshots[target_rollout][2] == source_size:
+            source = target_rollout
+    else:
+        source = choose_logical_source(session_id, target_rollout, candidates, snapshots)
+        if source is None:
+            paths = ", ".join(str(path) for path in candidates)
             raise SyncError(
-                f"divergent copies of session {session_id}: {candidate} and {source}; "
-                "histories differ, not a stale lock. Back up both branches before choosing one"
+                f"divergent copies of session {session_id}: {paths}; histories conflict, "
+                "not a stale lock. Back up all branches before choosing one"
             )
     if any(file_identity(path) != snapshot for path, snapshot in snapshots.items()):
         raise SyncError(f"session {session_id} changed during comparison; retry after its writer exits")
-    if target_rollout is not None and snapshots[target_rollout][2] == source_size:
-        return target_rollout
     return source
 
 
