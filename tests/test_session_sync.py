@@ -519,6 +519,53 @@ class SessionSyncTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "codex-cli 101.0.0")
 
+    def test_account_update_uses_main_installation(self):
+        result = subprocess.run(
+            [str(BIN / "codex-account"), "target", "update"],
+            env=self.environment, text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        launch = json.loads((self.root / "launched.json").read_text())
+        self.assertEqual(launch["home"], str(self.shared))
+        self.assertEqual(launch["args"], ["update"])
+        self.assertIsNone(launch["wrapped"])
+        self.assertEqual((self.target / "auth.json").read_text(), "{}")
+
+    def test_account_and_router_follow_shared_standalone_updates(self):
+        old_bin = self.root / "old-bin"
+        old_bin.mkdir()
+        old_executable = old_bin / "codex"
+        old_executable.write_text("#!/bin/sh\necho 'codex-cli 99.0.0'\n")
+        old_executable.chmod(0o700)
+
+        standalone = self.shared / "packages/standalone"
+        releases = []
+        for version in ("100.0.0", "101.0.0"):
+            release = standalone / "releases" / version
+            executable = release / "bin/codex"
+            executable.parent.mkdir(parents=True)
+            executable.write_text(f"#!/bin/sh\necho 'codex-cli {version}'\n")
+            executable.chmod(0o700)
+            releases.append(release)
+
+        environment = dict(self.environment)
+        environment.pop("CODEX_REAL_BIN")
+        environment["PATH"] = os.pathsep.join([str(old_bin), "/usr/bin", "/bin"])
+        current = standalone / "current"
+        for release in releases:
+            if current.is_symlink():
+                current.unlink()
+            current.symlink_to(release, target_is_directory=True)
+            for command in (
+                [str(BIN / "codex"), "--version"],
+                [str(BIN / "codex-account"), "target", "--version"],
+            ):
+                result = subprocess.run(
+                    command, env=environment, text=True, capture_output=True, timeout=10
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), f"codex-cli {release.name}")
+
     def start_daemon(self, home, acquire_writer=True, provider="openai", status="idle", ignore_override=False):
         program = """
 import base64, fcntl, hashlib, json, socket, struct, sys

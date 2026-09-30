@@ -55,6 +55,7 @@ find_real_codex() {
             fi
         fi
     done < <(
+        printf '%s\n' "$SHARED_HOME/packages/standalone/current/bin/codex"
         find \
             "$HOME/.npm-global/lib/node_modules/@openai/codex" \
             "$HOME/.local/lib/node_modules/@openai/codex" \

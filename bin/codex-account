@@ -24,6 +24,17 @@ die() {
 }
 
 
+find_codex_launcher() {
+    local companion
+    companion="$(dirname "$(readlink -f "$0")")/codex"
+    if [[ -x "$companion" ]]; then
+        printf '%s\n' "$companion"
+    else
+        command -v codex
+    fi
+}
+
+
 usage() {
     cat <<'USAGE'
 Usage:
@@ -105,11 +116,11 @@ case "${1:-}" in
     --lslimit)
         [[ "$#" -eq 1 ]] || die "用法: codex-account --lslimit"
         [[ -x "$LIMITS_BIN" ]] || die "找不到限额查询工具: $LIMITS_BIN"
-        command -v codex >/dev/null 2>&1 || die "找不到 codex"
+        CODEX_BIN="$(find_codex_launcher)" || die "找不到 codex"
 
         exec "$LIMITS_BIN" \
             --accounts-home "$ACCOUNTS_HOME" \
-            --codex-bin "$(command -v codex)"
+            --codex-bin "$CODEX_BIN"
         ;;
 
     -h|--help|"")
@@ -142,7 +153,7 @@ ACCOUNT_SESSIONS="$ACCOUNT_HOME/sessions"
 [[ -f "$ACCOUNT_AUTH" || "${1:-}" == "login" ]] ||
     die "账号认证不存在: $ACCOUNT_AUTH；请先运行 codex-account $ACCOUNT login"
 
-command -v codex >/dev/null 2>&1 ||
+CODEX_BIN="$(find_codex_launcher)" ||
     die "找不到 codex"
 
 command -v flock >/dev/null 2>&1 ||
@@ -154,8 +165,10 @@ command -v sha256sum >/dev/null 2>&1 ||
 command -v python3 >/dev/null 2>&1 ||
     die "找不到 python3，无法解析 session lineage"
 
-CODEX_BIN="$(command -v codex)"
-
+if [[ "${1:-}" == "update" ]]; then
+    exec env CODEX_HOME="$SHARED_HOME" CODEX_ACCOUNT_WRAPPED=1 \
+        "$CODEX_BIN" "$@"
+fi
 
 # ------------------------------------------------------------
 # 权限

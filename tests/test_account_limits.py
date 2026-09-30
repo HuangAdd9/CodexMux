@@ -134,6 +134,7 @@ class AccountLimitsTests(unittest.TestCase):
         )
         helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
         environment = os.environ.copy()
+        environment.pop("CODEX_REAL_BIN", None)
         environment.update(
             {
                 "CODEX_ACCOUNTS_HOME": str(self.accounts),
@@ -154,7 +155,7 @@ class AccountLimitsTests(unittest.TestCase):
         self.assertIn("--accounts-home", result.stdout)
         self.assertIn(str(self.accounts), result.stdout)
         self.assertIn("--codex-bin", result.stdout)
-        self.assertIn(str(self.codex), result.stdout)
+        self.assertIn(str(BIN / "codex"), result.stdout)
 
 
 if __name__ == "__main__":

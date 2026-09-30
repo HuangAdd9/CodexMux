@@ -9,6 +9,7 @@ config.toml
 .codex/
 .codex-accounts/
 .codex-wrapper-backups/
+.codex-account-backups/
 sessions/
 archived_sessions/
 backups/
@@ -24,3 +25,6 @@ logs/
 # Local notes and source material not intended for publication
 /Codex_session.md
 /Chat用法.md
+/docs/chat-mcp-research-20260915.md
+/.trellis-shell-home/
+/_audit_imgs/
