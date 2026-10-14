@@ -42,7 +42,7 @@ class AccountLimitsTests(unittest.TestCase):
                         }), flush=True)
                     else:
                         used = 20 if account == "alpha" else 35
-                        print(json.dumps({
+                        response = {
                             "id": 2,
                             "result": {
                                 "rateLimitsByLimitId": {
@@ -63,7 +63,18 @@ class AccountLimitsTests(unittest.TestCase):
                                     }
                                 }
                             },
-                        }), flush=True)
+                        }
+                        reset_summaries = {
+                            "alpha": {"availableCount": 3, "credits": []},
+                            "zeta": {"availableCount": 0, "credits": None},
+                            "null": None,
+                            "negative": {"availableCount": -1},
+                            "boolean": {"availableCount": True},
+                            "string": {"availableCount": "2"},
+                        }
+                        if account in reset_summaries:
+                            response["result"]["rateLimitResetCredits"] = reset_summaries[account]
+                        print(json.dumps(response), flush=True)
                 """
             )
         )
@@ -120,6 +131,28 @@ class AccountLimitsTests(unittest.TestCase):
         self.assertIn("alpha", result.stdout)
         self.assertIn("expired: need login again", result.stderr)
         self.assertNotIn("401", result.stderr)
+
+    def test_reset_counts_use_available_count_not_credit_list_length(self):
+        self.account("alpha")
+        self.account("zeta")
+
+        result = self.run_helper()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RESETS", result.stdout.splitlines()[0])
+        rows = [line.split() for line in result.stdout.splitlines()[2:]]
+        self.assertEqual([row[-1] for row in rows], ["3", "3", "0", "0"])
+
+    def test_missing_or_invalid_reset_counts_are_unknown_not_zero(self):
+        for account in ("missing", "null", "negative", "boolean", "string"):
+            self.account(account)
+
+        result = self.run_helper()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [line.split() for line in result.stdout.splitlines()[2:]]
+        self.assertEqual(len(rows), 10)
+        self.assertTrue(all(row[-1] == "-" for row in rows))
 
     def test_empty_account_directory_is_reported(self):
         result = self.run_helper()

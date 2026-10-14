@@ -210,6 +210,9 @@ def display_reset(timestamp):
 
 
 def rows_for_result(account, result):
+    reset_credits = result.get("rateLimitResetCredits")
+    reset_count = reset_credits.get("availableCount") if isinstance(reset_credits, dict) else None
+    resets = str(reset_count) if type(reset_count) is int and reset_count >= 0 else "-"
     limits = result.get("rateLimitsByLimitId")
     if not isinstance(limits, dict) or not limits:
         single = result.get("rateLimits")
@@ -236,6 +239,7 @@ def rows_for_result(account, result):
                     display_percent(used),
                     display_percent(remaining),
                     display_reset(window.get("resetsAt")),
+                    resets,
                 ]
             )
     if not rows:
@@ -244,7 +248,7 @@ def rows_for_result(account, result):
 
 
 def print_table(rows):
-    headers = ["ACCOUNT", "PLAN", "LIMIT", "BUCKET", "WINDOW", "USED", "LEFT", "RESET"]
+    headers = ["ACCOUNT", "PLAN", "LIMIT", "BUCKET", "WINDOW", "USED", "LEFT", "RESET", "RESETS"]
     widths = [max(len(row[index]) for row in [headers, *rows]) for index in range(len(headers))]
     print("  ".join(value.ljust(widths[index]) for index, value in enumerate(headers)))
     print("  ".join("-" * width for width in widths))

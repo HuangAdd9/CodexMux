@@ -62,7 +62,7 @@ codex-account work login status
 | `codex-account --help`                                 | 显示帮助                                      |
 | `codex-account --add work`                             | 新建账号目录，不登录                          |
 | `codex-account --list`                                 | 列出有登录文件的账号，不实时核验登录是否有效  |
-| `codex-account --lslimit`                              | 查询所有账号的额度和重置时间                  |
+| `codex-account --lslimit`                              | 查询所有账号的额度、重置时间和可用重置次数      |
 | `codex-account work login`                             | 登录或重新登录 work                           |
 | `codex-account work login status`                      | 检查 work 的登录状态                          |
 | `codex-account work logout`                            | 退出 work 的登录，保留账号目录                |
@@ -76,7 +76,7 @@ codex-account work login status
 
 `SESSION_ID` 替换成真实的会话 UUID，不要直接输入这个占位符。
 
-`--lslimit` 显示额度使用比例、剩余比例和重置时间；时间使用东八区 `Asia/Shanghai`。账号显示 `need login again` 时，重新执行该账号的登录命令。
+`--lslimit` 显示额度使用比例、剩余比例、重置时间和可用重置次数（`RESETS`）；时间使用东八区 `Asia/Shanghai`。`RESETS` 为账号级次数，不是各窗口分别拥有的次数；`0` 表示没有可用次数，`-` 表示接口未提供有效数据。账号显示 `need login again` 时，重新执行该账号的登录命令。
 
 在交互会话内可以输入 `/status` 查看状态，输入 `/exit` 退出。
 
