@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import argparse
 import base64
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
+from datetime import datetime
 import fcntl
 import hashlib
 import json
@@ -20,6 +21,7 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -97,11 +99,280 @@ def find_rollout(sessions_dir: Path, session_id: str) -> Path | None:
     if not sessions_dir.is_dir():
         return None
 
-    matches = sorted(sessions_dir.rglob(f"*-{session_id}.jsonl"))
+    matches = sorted(set(sessions_dir.rglob(f"*-{session_id}.jsonl"))
+                     | set(sessions_dir.rglob(f"*_{session_id}.jsonl")))
     if len(matches) > 1:
         paths = ", ".join(str(path) for path in matches)
         raise SyncError(f"multiple rollouts for {session_id} under {sessions_dir}: {paths}")
     return matches[0] if matches else None
+
+
+def rollout_id(path: Path) -> str:
+    identifier = path.stem[-36:]
+    if not UUID_RE.fullmatch(identifier):
+        raise SyncError(f"unrecognized rollout filename: {path}")
+    return identifier.lower()
+
+
+def session_metadata(path: Path) -> dict:
+    with path.open(encoding="utf-8") as handle:
+        record = json.loads(handle.readline())
+    payload = record.get("payload")
+    if record.get("type") != "session_meta" or not isinstance(payload, dict):
+        raise SyncError(f"invalid session metadata: {path}")
+    return payload
+
+
+def open_state(home: Path, name: str):
+    path = home / name
+    return sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)
+
+
+def selected_thread(home: Path, session_id: str) -> dict | None:
+    if not (home / "state_5.sqlite").exists():
+        return None
+    with closing(open_state(home, "state_5.sqlite")) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute("SELECT * FROM threads WHERE id = ?", (session_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def managed_rollout(home: Path, path: Path) -> Path:
+    resolved = path.resolve()
+    if not resolved.is_relative_to((home / "sessions").resolve()) or not resolved.is_file():
+        raise SyncError(f"selected rollout is missing or outside managed sessions: {path}")
+    if resolved.suffix != ".jsonl":
+        raise SyncError(f"compressed selected rollouts require native decompression first: {path}")
+    return resolved
+
+
+def compatible_segment(identifier: str, homes: list[Path], preferred: Path | None = None) -> Path:
+    candidates = [managed_rollout(home, path) for home in homes
+                  if (path := find_rollout(home / "sessions", identifier)) is not None]
+    if not candidates:
+        raise SyncError(f"missing lineage rollout {identifier}")
+    source = max(candidates, key=lambda path: path.stat().st_size)
+    if not all(is_prefix(path, source, path.stat().st_size) for path in candidates):
+        raise SyncError(f"conflicting copies of immutable rollout {identifier}; back up branches first")
+    if preferred in candidates and preferred.stat().st_size == source.stat().st_size:
+        return preferred
+    return source
+
+
+def rotated_chain(path: Path, homes: list[Path]) -> list[Path]:
+    chain = []
+    seen = set()
+    while path is not None:
+        identifier = rollout_id(path)
+        if identifier in seen or len(chain) >= MAX_LINEAGE_DEPTH:
+            raise SyncError(f"invalid rollout lineage at {path}")
+        logical_id = session_metadata(path).get("id")
+        prefix = path.stem[:-37] if path.stem[-37:-36] == "_" else path.stem
+        if not isinstance(logical_id, str) or not prefix.endswith("-" + logical_id):
+            raise SyncError(f"rollout filename does not match its session metadata: {path}")
+        seen.add(identifier)
+        chain.append(path)
+        reference = read_history_base(path)
+        if reference is None:
+            break
+        path = compatible_segment(reference["thread_id"], homes)
+        if reference.get("end_byte_offset") is None or reference.get("end_ordinal_exclusive") is None:
+            raise SyncError(f"missing paginated lineage bounds: {path}")
+        prefix_snapshot(path, reference["end_byte_offset"])
+    return chain
+
+
+def check_obsolete_continuation(path: Path, replacement: Path) -> None:
+    created = session_metadata(replacement).get("timestamp")
+    if not created:
+        raise SyncError(f"replacement rollout has no creation timestamp: {replacement}")
+    cutoff = datetime.fromisoformat(created.replace("Z", "+00:00"))
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            record = json.loads(line)
+            payload = record.get("payload", {})
+            meaningful = (record.get("type") in ("response_item", "compacted") or
+                          record.get("type") == "event_msg" and
+                          payload.get("type") in ("task_started", "user_message"))
+            if not meaningful:
+                continue
+            timestamp = record.get("timestamp")
+            if not timestamp or datetime.fromisoformat(timestamp.replace("Z", "+00:00")) >= cutoff:
+                raise SyncError(
+                    f"session continued independently after revert: {path}; back up branches first"
+                )
+
+
+HISTORY_TABLES = ("thread_turns", "thread_items", "thread_realtime_items",
+                  "thread_history_projection_state")
+
+
+def projection_complete(home: Path, paths: list[Path]) -> bool:
+    if not (home / "thread_history_1.sqlite").exists():
+        return False
+    with closing(open_state(home, "thread_history_1.sqlite")) as connection:
+        for path in paths:
+            row = connection.execute(
+                "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = ?",
+                (rollout_id(path),),
+            ).fetchone()
+            if row is None or row[0] != path.stat().st_size:
+                return False
+    return True
+
+
+def copy_history_rows(source, destination, identifier: str, schema: str = "main") -> None:
+    for table in HISTORY_TABLES:
+        source_columns = [row[1] for row in source.execute(f'PRAGMA table_info("{table}")')]
+        target_columns = [row[1] for row in destination.execute(f'PRAGMA {schema}.table_info("{table}")')]
+        if source_columns != target_columns or not source_columns:
+            raise SyncError(f"incompatible history database schema: {table}")
+        destination.execute(f'DELETE FROM {schema}."{table}" WHERE thread_id = ?', (identifier,))
+        rows = source.execute(f'SELECT * FROM "{table}" WHERE thread_id = ?', (identifier,))
+        placeholders = ",".join("?" for _column in source_columns)
+        while batch := rows.fetchmany(256):
+            destination.executemany(f'INSERT INTO {schema}."{table}" VALUES ({placeholders})', batch)
+
+
+def synchronize_rotated(args, homes: list[Path], stack: ExitStack) -> bool:
+    selections = []
+    for home in homes:
+        row = selected_thread(home, args.session_id)
+        if row:
+            path = Path(row["rollout_path"])
+            if rollout_id(path) != args.session_id:
+                managed_rollout(home, path)
+            selections.append((home, path, row))
+        else:
+            if next((home / "sessions").rglob(f"*-{args.session_id}_*.jsonl"), None):
+                raise SyncError("replacement rollouts exist without an authoritative SQLite pointer")
+            path = find_rollout(home / "sessions", args.session_id)
+            if path:
+                selections.append((home, path, None))
+    chains = {}
+    for _home, path, row in selections:
+        if row is not None and (rollout_id(path) != args.session_id or path.exists() and
+                                session_metadata(path).get("history_mode") == "paginated" and
+                                read_history_base(path)):
+            chain = rotated_chain(compatible_segment(rollout_id(path), homes, path), homes)
+            if any(segment.stem[-37:-36] == "_" for segment in chain):
+                chains[path] = chain
+    rotated = [entry for entry in selections if entry[1] in chains]
+    if not rotated:
+        if any(next((home / "sessions").rglob(f"*-{args.session_id}_*.jsonl"), None)
+               for home in homes):
+            raise SyncError("replacement rollouts exist without an authoritative SQLite pointer")
+        return False
+
+    heads = {rollout_id(path): path for _home, path, _row in rotated}
+    leaves = [path for identifier, path in heads.items()
+              if not any(identifier in {rollout_id(parent) for parent in chain[1:]}
+                         for chain in chains.values())]
+    if len(leaves) != 1:
+        raise SyncError("divergent replacement rollouts; back up branches before choosing one")
+    selected = leaves[0]
+    chain = chains[selected]
+    if session_metadata(chain[0]).get("id") != args.session_id:
+        raise SyncError(f"selected rollout belongs to another session: {selected}")
+    snapshots = {path: file_identity(path) for path in chain}
+    identifiers = [rollout_id(path) for path in chain]
+    logical_ids = {session_metadata(path).get("id") for path in chain}
+    for identifier in sorted(logical_ids - {args.session_id}, key=str):
+        if not isinstance(identifier, str) or not UUID_RE.fullmatch(identifier):
+            raise SyncError("invalid logical session ID in rollout lineage")
+        stack.enter_context(session_lock(args.lock_home, identifier))
+        for home in homes:
+            native_writer_guard(home, identifier, stack)
+    for _home, path, _row in selections:
+        identifier = rollout_id(path)
+        if identifier not in identifiers:
+            raise SyncError(f"unrelated active rollout for session {args.session_id}: {path}")
+        if identifier != identifiers[0]:
+            check_obsolete_continuation(compatible_segment(identifier, homes), chain[identifiers.index(identifier) - 1])
+
+    target = homes[0]
+    original_row = selected_thread(target, args.session_id)
+    destinations = [(path, target / "sessions" / relative_rollout_path(path, homes)) for path in chain]
+    if original_row and original_row["rollout_path"] == str(destinations[0][1]) and all(
+        destination.exists() and file_identity(source)[2] == file_identity(destination)[2]
+        and is_prefix(source, destination, source.stat().st_size)
+        for source, destination in destinations
+    ) and projection_complete(target, chain):
+        return True
+
+    source_row = next(row for _home, path, row in rotated if path == selected)
+    if not (target / "state_5.sqlite").exists() or not (target / "thread_history_1.sqlite").exists():
+        raise SyncError("initialize this account with native Codex once before importing paginated history")
+    sources = []
+    for path in chain:
+        home = next(home for home in homes if path.is_relative_to(home / "sessions"))
+        connection = open_state(home, "thread_history_1.sqlite")
+        stack.callback(connection.close)
+        connection.execute("BEGIN")
+        projection = connection.execute(
+            "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = ?",
+            (rollout_id(path),),
+        ).fetchone()
+        if projection is None or projection[0] != path.stat().st_size:
+            raise SyncError(f"history projection is incomplete for {path}; resume and exit its source first")
+        if home == target:
+            connection.close()
+            sources.append(None)
+        else:
+            sources.append(connection)
+
+    backup_root = args.lock_home.parent / "backups" / args.session_id
+    backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    backup = Path(tempfile.mkdtemp(prefix="rollout-sync-", dir=backup_root))
+    backup.chmod(0o700)
+    (backup / "thread.json").write_text(json.dumps(original_row, ensure_ascii=False) + "\n")
+    with closing(sqlite3.connect(target / "thread_history_1.sqlite", timeout=5)) as history, \
+            closing(sqlite3.connect(backup / "history.sqlite")) as saved, saved:
+        for table in HISTORY_TABLES:
+            schema = history.execute("SELECT sql FROM sqlite_master WHERE name = ?", (table,)).fetchone()
+            if schema is None:
+                raise SyncError(f"missing history table: {table}")
+            saved.execute(schema[0])
+        for identifier in identifiers:
+            copy_history_rows(history, saved, identifier)
+    print(f"[{args.log_prefix}] session_backup={backup}", file=sys.stderr)
+    for source, destination in reversed(destinations):
+        if source == destination:
+            continue
+        if destination.exists():
+            shutil.copy2(destination, backup / destination.name)
+        copy_atomically(source, destination)
+
+    with closing(sqlite3.connect(target / "state_5.sqlite", timeout=5)) as state, state:
+        state.execute("ATTACH DATABASE ? AS history", (str(target / "thread_history_1.sqlite"),))
+        state.execute("BEGIN IMMEDIATE")
+        state.row_factory = sqlite3.Row
+        current = state.execute("SELECT * FROM threads WHERE id = ?", (args.session_id,)).fetchone()
+        if (dict(current) if current else None) != original_row:
+            raise SyncError("target session metadata changed during synchronization")
+        for source, identifier in zip(sources, identifiers):
+            if source is not None:
+                copy_history_rows(source, state, identifier, schema="history")
+        if any(file_identity(path) != snapshot for path, snapshot in snapshots.items()):
+            raise SyncError("source lineage changed during synchronization")
+        for home, path, row in selections:
+            current_source = selected_thread(home, args.session_id)
+            if (row is None and current_source is not None or row is not None and
+                    (current_source is None or current_source["rollout_path"] != str(path))):
+                raise SyncError("source rollout pointer changed during synchronization")
+        if original_row:
+            state.execute("UPDATE threads SET rollout_path = ?, history_mode = 'paginated' WHERE id = ?",
+                          (str(destinations[0][1]), args.session_id))
+        else:
+            columns = {row[1] for row in state.execute("PRAGMA table_info(threads)")}
+            values = {key: value for key, value in source_row.items() if key in columns}
+            values.update(rollout_path=str(destinations[0][1]), thread_section_id=None, project_id=None)
+            values = {key: value for key, value in values.items() if key in columns}
+            names = ",".join(f'"{key}"' for key in values)
+            placeholders = ",".join("?" for _key in values)
+            state.execute(f"INSERT INTO threads ({names}) VALUES ({placeholders})", tuple(values.values()))
+    print(f"[{args.log_prefix}] selected_rollout={identifiers[0]} lineage_segments={len(chain)}", file=sys.stderr)
+    return True
 
 
 def read_history_base(rollout: Path) -> dict | None:
@@ -527,6 +798,8 @@ def synchronize(args: argparse.Namespace) -> None:
 
     with ExitStack() as lineage_locks, lock_path.open("a+b") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if synchronize_rotated(args, homes, lineage_locks):
+            return
         current_id: str | None = args.session_id
         seen_ids: set[str] = set()
         copies = []
@@ -908,7 +1181,7 @@ def main() -> int:
     args = parse_args()
     try:
         return synchronize_and_run(args)
-    except (OSError, SyncError) as exc:
+    except (OSError, ValueError, sqlite3.Error, SyncError) as exc:
         print(f"{args.log_prefix}: {exc}", file=sys.stderr)
         return 1
     return 0

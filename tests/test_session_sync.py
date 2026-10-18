@@ -7,6 +7,7 @@ from pathlib import Path
 import select
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -128,6 +129,190 @@ class SessionSyncTests(unittest.TestCase):
         if process.poll() is None:
             process.terminate()
         process.communicate(timeout=5)
+
+    def history_database(self, home, path=None):
+        with sqlite3.connect(home / "state_5.sqlite") as state:
+            state.execute("CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, rollout_path TEXT, "
+                          "history_mode TEXT, model_provider TEXT DEFAULT 'openai')")
+            if path:
+                state.execute("INSERT OR REPLACE INTO threads VALUES (?, ?, 'paginated', 'openai')",
+                              (SESSION, str(path)))
+        with sqlite3.connect(home / "thread_history_1.sqlite") as history:
+            for table in SYNC.HISTORY_TABLES:
+                if table == "thread_history_projection_state":
+                    history.execute(f"CREATE TABLE IF NOT EXISTS {table} "
+                                    "(thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER, "
+                                    "next_rollout_ordinal INTEGER)")
+                else:
+                    history.execute(f"CREATE TABLE IF NOT EXISTS {table} "
+                                    "(thread_id TEXT, item_json TEXT)")
+            if path:
+                identifier = SYNC.rollout_id(path)
+                history.execute("INSERT OR REPLACE INTO thread_history_projection_state VALUES (?, ?, 10)",
+                                (identifier, path.stat().st_size))
+                history.execute("INSERT INTO thread_items VALUES (?, ?)", (identifier, path.name))
+
+    def rotated_fixture(self, identifier=PARENT, parent=None, home=None):
+        home = home or self.other
+        if parent is None:
+            parent = self.rollout(home)
+            record = self.response("original", "before revert")
+            record["timestamp"] = "2026-10-14T00:00:00Z"
+            with parent.open("a") as handle:
+                handle.write(json.dumps(record) + "\n")
+            self.history_database(home, parent)
+        path = home / "sessions/2026/10/17" / f"rollout-test-{SESSION}_{identifier}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        metadata = {"type": "session_meta", "payload": {
+            "id": SESSION, "history_mode": "paginated", "timestamp": "2026-10-17T00:00:00Z",
+            "history_base": {"thread_id": SYNC.rollout_id(parent),
+                             "end_byte_offset": parent.stat().st_size, "end_ordinal_exclusive": 3}}}
+        response = self.response(identifier, "after revert")
+        response["timestamp"] = "2026-10-17T01:00:00Z"
+        path.write_text(json.dumps(metadata) + "\n" + json.dumps(response) + "\n")
+        self.history_database(home, path)
+        self.history_database(self.target)
+        return parent, path
+
+    def test_rotated_history_imports_pointer_lineage_and_projection(self):
+        parent, source = self.rotated_fixture()
+        stale = self.rollout(self.target)
+        self.history_database(self.target, stale)
+        with sqlite3.connect(self.target / "thread_history_1.sqlite") as history:
+            history.execute("INSERT INTO thread_items VALUES ('unrelated', 'keep')")
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = SYNC.selected_thread(self.target, SESSION)
+        target = self.target / source.relative_to(self.other)
+        self.assertEqual(row["rollout_path"], str(target))
+        self.assertEqual(source.read_bytes(), target.read_bytes())
+        self.assertEqual(parent.read_bytes(), stale.read_bytes())
+        with sqlite3.connect(self.target / "thread_history_1.sqlite") as history:
+            self.assertEqual(history.execute("SELECT count(*) FROM thread_items WHERE thread_id IN (?, ?)",
+                                             (SESSION, PARENT)).fetchone()[0], 2)
+            self.assertEqual(history.execute("SELECT item_json FROM thread_items WHERE thread_id='unrelated'")
+                             .fetchone()[0], "keep")
+        self.assertIn("session_backup=", result.stderr)
+        before = SYNC.file_identity(target)
+        repeated = self.run_sync()
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertNotIn("session_backup=", repeated.stderr)
+        self.assertEqual(before, SYNC.file_identity(target))
+
+    def test_rotated_history_can_import_new_thread_row(self):
+        _parent, source = self.rotated_fixture()
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(SYNC.selected_thread(self.target, SESSION)["rollout_path"].endswith(source.name))
+
+    def test_rotated_history_resolves_physical_parent_id(self):
+        _parent, first = self.rotated_fixture()
+        second_id = "33333333-3333-4333-8333-333333333333"
+        _first, second = self.rotated_fixture(second_id, parent=first)
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("lineage_segments=3", result.stderr)
+        self.assertTrue(SYNC.selected_thread(self.target, SESSION)["rollout_path"].endswith(second.name))
+
+    def test_rotated_history_rejects_sibling_reverts(self):
+        parent, _first = self.rotated_fixture()
+        second_id = "33333333-3333-4333-8333-333333333333"
+        self.rollout(self.shared).write_bytes(parent.read_bytes())
+        self.history_database(self.shared, self.rollout(self.shared))
+        self.rotated_fixture(second_id, parent=self.rollout(self.shared), home=self.shared)
+        result = self.run_sync()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("divergent replacement", result.stderr)
+        self.assertIsNone(SYNC.selected_thread(self.target, SESSION))
+
+    def test_rotated_history_rejects_new_messages_on_obsolete_branch(self):
+        parent, _source = self.rotated_fixture()
+        stale = self.rollout(self.target)
+        stale.write_bytes(parent.read_bytes())
+        record = self.response("independent", "do not discard")
+        record["timestamp"] = "2026-10-18T00:00:00Z"
+        with stale.open("a") as handle:
+            handle.write(json.dumps(record) + "\n")
+        self.history_database(self.target, stale)
+        result = self.run_sync()
+        self.assertIn("continued independently", result.stderr)
+        self.assertEqual(SYNC.selected_thread(self.target, SESSION)["rollout_path"], str(stale))
+
+    def test_rotated_history_checks_unindexed_old_rollout(self):
+        parent, _source = self.rotated_fixture()
+        stale = self.rollout(self.shared)
+        record = self.response("independent", "unindexed but important")
+        record["timestamp"] = "2026-10-18T00:00:00Z"
+        stale.write_bytes(parent.read_bytes() + (json.dumps(record) + "\n").encode())
+        self.assertIn("continued independently", self.run_sync().stderr)
+
+    def test_rotated_history_respects_native_writer_lock(self):
+        self.rotated_fixture()
+        directory = self.other / "thread-writer-locks"
+        directory.mkdir()
+        with (directory / f"{SESSION}.lock").open("a+b") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            result = self.run_sync()
+        self.assertIn("active native writer", result.stderr)
+        self.assertIsNone(SYNC.selected_thread(self.target, SESSION))
+
+    def test_fork_of_rotated_history_copies_immutable_dependencies(self):
+        _parent, rotated = self.rotated_fixture()
+        fork_id = "33333333-3333-4333-8333-333333333333"
+        metadata = {"type": "session_meta", "payload": {
+            "id": fork_id, "history_mode": "paginated", "timestamp": "2026-10-18T00:00:00Z",
+            "history_base": {"thread_id": PARENT, "end_byte_offset": rotated.stat().st_size,
+                             "end_ordinal_exclusive": 4}}}
+        fork = rotated.with_name(f"rollout-test-{fork_id}.jsonl")
+        fork.write_text(json.dumps(metadata) + "\n")
+        self.history_database(self.other, fork)
+        with sqlite3.connect(self.other / "state_5.sqlite") as state:
+            state.execute("UPDATE threads SET id=? WHERE id=?", (fork_id, SESSION))
+            state.execute("INSERT INTO threads VALUES (?, ?, 'paginated', 'openai')", (SESSION, str(rotated)))
+        result = self.run_sync(session=fork_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("lineage_segments=3", result.stderr)
+
+    def test_rotated_history_allows_metadata_only_resume_of_obsolete_branch(self):
+        parent, _source = self.rotated_fixture()
+        stale = self.rollout(self.target)
+        stale.write_bytes(parent.read_bytes() + b'{"type":"event_msg","payload":{"type":"token_count"}}\n')
+        self.history_database(self.target, stale)
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rotated_history_requires_complete_projection(self):
+        _parent, _source = self.rotated_fixture()
+        with sqlite3.connect(self.other / "thread_history_1.sqlite") as history:
+            history.execute("UPDATE thread_history_projection_state SET next_rollout_byte_offset=0")
+        result = self.run_sync()
+        self.assertIn("projection is incomplete", result.stderr)
+        self.assertIsNone(SYNC.selected_thread(self.target, SESSION))
+
+    def test_rotated_history_preserves_state_on_schema_mismatch(self):
+        _parent, _source = self.rotated_fixture()
+        stale = self.rollout(self.target)
+        self.history_database(self.target, stale)
+        with sqlite3.connect(self.target / "thread_history_1.sqlite") as history:
+            history.execute("ALTER TABLE thread_items ADD COLUMN future_field TEXT")
+        result = self.run_sync()
+        self.assertIn("incompatible history database schema", result.stderr)
+        self.assertEqual(SYNC.selected_thread(self.target, SESSION)["rollout_path"], str(stale))
+
+    def test_rotated_history_rejects_missing_authoritative_pointer(self):
+        self.rotated_fixture()
+        with sqlite3.connect(self.other / "state_5.sqlite") as state:
+            state.execute("DELETE FROM threads")
+        result = self.run_sync()
+        self.assertIn("without an authoritative SQLite pointer", result.stderr)
+
+    def test_rotated_history_rejects_outside_path(self):
+        _parent, source = self.rotated_fixture()
+        outside = self.root / source.name
+        outside.write_bytes(source.read_bytes())
+        with sqlite3.connect(self.other / "state_5.sqlite") as state:
+            state.execute("UPDATE threads SET rollout_path=?", (str(outside),))
+        self.assertIn("outside managed sessions", self.run_sync().stderr)
 
     def test_largest_target_still_detects_divergence(self):
         self.rollout(self.target, suffix="new branch much longer\n")
