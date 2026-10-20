@@ -281,6 +281,51 @@ class SessionSyncTests(unittest.TestCase):
         result = self.run_sync()
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_rotated_history_allows_settings_appended_to_shorter_old_copy(self):
+        parent, source = self.rotated_fixture()
+        stale = self.rollout(self.target)
+        settings = {"type": "event_msg", "payload": {"type": "thread_settings_applied"}}
+        stale.write_text(parent.read_text().splitlines()[0] + "\n" + json.dumps(settings) + "\n")
+        self.history_database(self.target, stale)
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stale.read_bytes(), parent.read_bytes())
+        self.assertTrue(SYNC.selected_thread(self.target, SESSION)["rollout_path"].endswith(source.name))
+
+    def test_rotated_settings_tail_does_not_hide_a_new_message(self):
+        parent, _source = self.rotated_fixture()
+        stale = self.rollout(self.target)
+        settings = {"type": "event_msg", "payload": {"type": "thread_settings_applied"}}
+        independent = self.response("new-message", "never discard")
+        stale.write_text(parent.read_text().splitlines()[0] + "\n" + json.dumps(settings) + "\n" +
+                         json.dumps(independent) + "\n")
+        self.history_database(self.target, stale)
+        before = stale.read_bytes()
+        result = self.run_sync()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("conflicting copies", result.stderr)
+        self.assertEqual(stale.read_bytes(), before)
+        self.assertEqual(SYNC.selected_thread(self.target, SESSION)["rollout_path"], str(stale))
+
+    def test_settings_tail_requires_exact_history_bytes_and_complete_records(self):
+        source = self.rollout(self.other, suffix=json.dumps(self.response("old", "original")) + "\n")
+        stale = self.rollout(self.target)
+        settings = {"type": "event_msg", "payload": {"type": "thread_settings_applied"}}
+        header = source.read_text().splitlines()[0] + "\n"
+        for tail in (json.dumps(settings), '{"type":"event_msg",\n',
+                     json.dumps({"type": "event_msg", "payload": {"type": "future_event"}}) + "\n",
+                     json.dumps(self.response("old", "modified")) + "\n" + json.dumps(settings) + "\n"):
+            with self.subTest(tail=tail):
+                stale.write_text(header + tail)
+                self.assertFalse(SYNC.settings_tail_prefix(stale, source))
+
+    def test_immutable_comparison_refuses_files_changed_during_validation(self):
+        self.rollout(self.shared)
+        with mock.patch.object(SYNC, "is_prefix", return_value=True), \
+                mock.patch.object(SYNC, "file_identity", side_effect=[(1, 2, 3, 4, 5), (1, 2, 4, 4, 5)]):
+            with self.assertRaisesRegex(SYNC.SyncError, "changed during comparison"):
+                SYNC.compatible_segment(SESSION, [self.shared])
+
     def test_rotated_history_requires_complete_projection(self):
         _parent, _source = self.rotated_fixture()
         with sqlite3.connect(self.other / "thread_history_1.sqlite") as history:

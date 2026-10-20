@@ -151,10 +151,14 @@ def compatible_segment(identifier: str, homes: list[Path], preferred: Path | Non
                   if (path := find_rollout(home / "sessions", identifier)) is not None]
     if not candidates:
         raise SyncError(f"missing lineage rollout {identifier}")
-    source = max(candidates, key=lambda path: path.stat().st_size)
-    if not all(is_prefix(path, source, path.stat().st_size) for path in candidates):
+    snapshots = {path: file_identity(path) for path in candidates}
+    source = max(candidates, key=lambda path: snapshots[path][2])
+    if not all(is_prefix(path, source, snapshots[path][2]) or
+               settings_tail_prefix(path, source) for path in candidates):
         raise SyncError(f"conflicting copies of immutable rollout {identifier}; back up branches first")
-    if preferred in candidates and preferred.stat().st_size == source.stat().st_size:
+    if any(file_identity(path) != snapshot for path, snapshot in snapshots.items()):
+        raise SyncError(f"rollout {identifier} changed during comparison; retry after its writer exits")
+    if preferred in candidates and snapshots[preferred][2] == snapshots[source][2]:
         return preferred
     return source
 
@@ -465,6 +469,26 @@ def is_prefix(shorter: Path, longer: Path, length: int) -> bool:
             if len(left_chunk) != chunk_size or left_chunk != right.read(chunk_size):
                 return False
             remaining -= chunk_size
+    return True
+
+
+def settings_tail_prefix(shorter: Path, longer: Path) -> bool:
+    diverged = False
+    with shorter.open("rb") as left, longer.open("rb") as right:
+        for line in left:
+            other = right.readline()
+            if not diverged and line == other:
+                continue
+            diverged = True
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                return False
+            if (not line.endswith(b"\n") or not isinstance(record, dict) or
+                    record.get("type") != "event_msg" or
+                    not isinstance(record.get("payload"), dict) or
+                    record["payload"].get("type") != "thread_settings_applied"):
+                return False
     return True
 
 
